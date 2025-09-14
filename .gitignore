@@ -1,0 +1,65 @@
+# ===================================================================
+# SENSITIVE & ENVIRONMENT FILES
+# 绝不上传任何包含密码、密钥或私密配置的文件！
+# ===================================================================
+#
+# 您指定的密钥文件
+keys.txt
+
+# 其他常见的敏感文件名
+api-keys.txt
+secrets.json
+
+# 通用的环境变量文件
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+# ===================================================================
+# OPERATING SYSTEM & IDE FILES
+# 忽略操作系统和代码编辑器自动生成的文件
+# ===================================================================
+#
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE & Editor configurations
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# ===================================================================
+# LOGS & DEPENDENCIES
+# 忽略日志文件、依赖缓存和构建产物
+# ===================================================================
+#
+# Log files
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build & output directories
+dist/
+build/
+out/
+
+
+# ===================================================================
+# DENO CACHE & LOCK
+# ===================================================================
+.deno/
+deno_dir/
+deno_cache/
+deno.lock

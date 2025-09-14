@@ -1,0 +1,97 @@
+import { serve } from "https://deno.land/std@0.192.0/http/server.ts";
+
+const CEREBRAS_API_URL = 'https://api.cerebras.ai/v1/chat/completions';
+const RATE_LIMIT_MS = 200; 
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+const requestQueue: { body: any; resolve: (response: Response) => void }[] = [];
+
+let apiKeys: string[] = [];
+let currentKeyIndex = 0;
+
+function initializeKeys() {
+  const keysString = Deno.env.get("CEREBRAS_API_KEYS");
+  if (keysString) {
+    apiKeys = keysString.split(',').map(key => key.trim()).filter(key => key);
+    console.log(`Initialized with ${apiKeys.length} API keys.`);
+  } else {
+    console.error("CEREBRAS_API_KEYS environment variable not set!");
+  }
+}
+
+async function processQueue() {
+  if (requestQueue.length === 0 || apiKeys.length === 0) {
+    return;
+  }
+
+  const { body, resolve } = requestQueue.shift()!;
+
+  const apiKey = apiKeys[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+  
+  console.log(`Processing request with key index: ${currentKeyIndex}`);
+
+  try {
+    const apiResponse = await fetch(CEREBRAS_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const responseHeaders = new Headers(apiResponse.headers);
+    Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+      responseHeaders.set(key, value);
+    });
+
+    resolve(new Response(apiResponse.body, {
+      status: apiResponse.status,
+      statusText: apiResponse.statusText,
+      headers: responseHeaders,
+    }));
+
+  } catch (error) {
+    console.error("Error forwarding request to Cerebras:", error);
+    resolve(new Response(`Proxy error: ${error.message}`, { status: 502, headers: CORS_HEADERS }));
+  }
+}
+
+async function handler(req: Request): Promise<Response> {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  if (req.method !== 'POST') {
+    return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+  }
+
+  if (apiKeys.length === 0) {
+     return new Response("Server configuration error: No API keys configured.", { status: 500, headers: CORS_HEADERS });
+  }
+
+  try {
+    const requestBody = await req.json();
+
+    return new Promise((resolve) => {
+      requestQueue.push({ body: requestBody, resolve });
+    });
+
+  } catch (error) {
+    return new Response(`Invalid JSON body: ${error.message}`, { status: 400, headers: CORS_HEADERS });
+  }
+}
+
+initializeKeys();
+serve(handler);
+setInterval(processQueue, RATE_LIMIT_MS);
+
+console.log(`Cerebras smart proxy started.`);
+console.log(`- Request processing interval: ${RATE_LIMIT_MS}ms`);
+console.log(`- Max requests per second (approx): ${1000 / RATE_LIMIT_MS}`);

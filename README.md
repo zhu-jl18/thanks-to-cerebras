@@ -4,7 +4,7 @@
 感谢 Cerebras 提供免费AI推理服务。
 
 ## ⚠️ 免责声明
-本项目仅供个人学习和研究使用。
+本项目仅供个人学习和研究使用。代码和文档均由claude code自动生成。
 
 - 请遵守 Cerebras 官方的使用条款和服务协议
 - 禁止用于商业用途或大规模生产环境
@@ -17,13 +17,13 @@ Cerebras 专注于高性能AI推理，免费用户每天可获得 1,000,000 toke
 
 <div align="center">
   <p>可用模型及其限制示意</p>
-  <img src="image/limits.png" alt="沉浸式翻译" width="50%">
+  <img src="image/limits.png" alt="沉浸式翻译" width="70%">
 </div>
 
 
 本项目专为沉浸式翻译设计，实现 Cerebras API 代理转发，支持多API密钥轮换和请求限流。
 
-建议注册多个 Cerebras 账号获取更多免费额度，项目内置轮询功能。
+也许可以注册多个 Cerebras 账号获取更多免费额度，项目内置轮询功能。
 
 ### 🔗 代码来源
 本项目基于 [linux.do 社区分享](https://linux.do/t/topic/956453) 的代码改进而来。
@@ -35,16 +35,23 @@ Cerebras 专注于高性能AI推理，免费用户每天可获得 1,000,000 toke
 ### 核心架构
 
 ```mermaid
-graph LR
-    A[沉浸式翻译插件] --> B[Deno Deploy 代理]
-    B --> C[鉴权验证]
-    C --> D[请求队列]
-    D --> E[模型映射]
-    E --> F[API密钥轮换器]
-    F --> G[Cerebras API]
-    G --> H[AI模型推理]
-    H --> I[翻译结果]
-    I --> A
+graph TB
+        A[沉浸式翻译插件]
+        A --> B[Deno 代理]
+
+        subgraph P[处理流水线]
+            direction LR
+            C{鉴权?}
+            D[排队/限流]
+            E[模型映射]
+            F[密钥轮换]
+        end
+
+        B --> C --> D --> E --> F --> G[Cerebras API 推理]
+        G --> H[翻译结果]
+        H --> A
+
+        C -->|未设置/跳过| D
 ```
 
 ### 关键特性
@@ -117,7 +124,7 @@ sequenceDiagram
 
 <div align="center">
   <p>Deno Deploy 配置</p>
-  <img src="image/配置说明1.png" alt="Deno Deploy" width="60%">
+  <img src="image/配置说明1.png" alt="Deno Deploy" width="70%">
 </div>
 <div align="center">
   <p>沉浸式翻译配置</p>

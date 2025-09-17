@@ -28,6 +28,57 @@ Cerebras 专注于高性能AI推理，免费用户每天可获得 1,000,000 toke
 ### 🔗 代码来源
 本项目基于 [linux.do 社区分享](https://linux.do/t/topic/956453) 的代码改进而来。
 
+
+## 🚀 快速部署
+
+提供两个版本供选择：基础版和增强版（支持鉴权+模型默认映射）
+
+### 🍳 快速部署1 - 基础版本
+
+1.  **获取 Cerebras Key**:
+     * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
+1.  **部署到 Deno**:
+    *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
+    *   把`deno.ts` 的代码粘贴进去。
+2.  **配置环境变量**:
+    *   添加 `CEREBRAS_API_KEYS`。
+    *   值填写 Cerebras Key，多个用英文逗号 `,` 分隔，不要留空。
+3.  **配置沉浸式翻译**:
+    *   **API Key**: 任意填写。
+    *   **上游地址**: `https://<你的Deno项目名>.deno.dev/v1/chat/completions`。
+    *   **模型**: `gpt-oss-120b` 或 `qwen-3-235b-a22b-instruct-2507`。
+
+### 🆕 快速部署2 - 增强版本（推荐）
+
+1.  **获取 Cerebras Key**:
+     * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
+2.  **部署到 Deno**:
+    *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
+    *   把`deno_new.ts` 的代码粘贴进去。
+3.  **配置环境变量**:
+    *   **必填**: 添加 `CEREBRAS_API_KEYS`，值填写 Cerebras Key，多个用英文逗号 `,` 分隔。
+    *   **可选**: 添加 `AUTH_PASSWORD`，设置鉴权密码（不设置则无鉴权）。
+4.  **配置沉浸式翻译**:
+    *   **API Key**: 如果设置了 `AUTH_PASSWORD` 环境变量则填写密码，否则任意填写。
+    *   **上游地址**: `https://<你的Deno项目名>.deno.dev/v1/chat/completions`。
+    *   **模型**: 任意填写（如 `gpt-4`、`claude` 等），会自动映射到 `qwen-3-235b-a22b-instruct-2507`。
+
+### 增强版特点
+- 可通过环境变量 `AUTH_PASSWORD` 启用鉴权（可选）
+- 支持模型名称自动映射，降低配置复杂度
+
+### 📸 配置截图
+
+<div align="center">
+  <p>Deno Deploy 配置</p>
+  <img src="image/配置说明1.png" alt="Deno Deploy" width="70%">
+</div>
+<div align="center">
+  <p>沉浸式翻译配置</p>
+  <img src="image/配置说明2.png" alt="沉浸式翻译" width="70%">
+</div>
+
+
 ## ⚙️ 技术原理
 
 通过代理转发机制，将沉浸式翻译的请求路由至 Cerebras API。
@@ -82,54 +133,8 @@ sequenceDiagram
     DP->>IT: 流式返回结果
 ```
 
-## 🚀 快速部署
 
-提供两个版本供选择：基础版和增强版（支持鉴权+模型默认映射）
 
-### 🍳 快速部署1 - 基础版本
-
-1.  **获取 Cerebras Key**:
-     * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
-1.  **部署到 Deno**:
-    *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
-    *   把`deno.ts` 的代码粘贴进去。
-2.  **配置环境变量**:
-    *   添加 `CEREBRAS_API_KEYS`。
-    *   值填写 Cerebras Key，多个用英文逗号 `,` 分隔，不要留空。
-3.  **配置沉浸式翻译**:
-    *   **API Key**: 任意填写。
-    *   **上游地址**: `https://<你的Deno项目名>.deno.dev/v1/chat/completions`。
-    *   **模型**: `gpt-oss-120b` 或 `qwen-3-235b-a22b-instruct-2507`。
-
-### 🆕 快速部署2 - 增强版本（推荐）
-
-1.  **获取 Cerebras Key**:
-     * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
-2.  **部署到 Deno**:
-    *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
-    *   把`deno_new.ts` 的代码粘贴进去。
-3.  **配置环境变量**:
-    *   **必填**: 添加 `CEREBRAS_API_KEYS`，值填写 Cerebras Key，多个用英文逗号 `,` 分隔。
-    *   **可选**: 添加 `AUTH_PASSWORD`，设置鉴权密码（不设置则无鉴权）。
-4.  **配置沉浸式翻译**:
-    *   **API Key**: 如果设置了 `AUTH_PASSWORD` 环境变量则填写密码，否则任意填写。
-    *   **上游地址**: `https://<你的Deno项目名>.deno.dev/v1/chat/completions`。
-    *   **模型**: 任意填写（如 `gpt-4`、`claude` 等），会自动映射到 `qwen-3-235b-a22b-instruct-2507`。
-
-### 增强版特点
-- 可通过环境变量 `AUTH_PASSWORD` 启用鉴权（可选）
-- 支持模型名称自动映射，降低配置复杂度
-
-### 📸 配置截图
-
-<div align="center">
-  <p>Deno Deploy 配置</p>
-  <img src="image/配置说明1.png" alt="Deno Deploy" width="70%">
-</div>
-<div align="center">
-  <p>沉浸式翻译配置</p>
-  <img src="image/配置说明2.png" alt="沉浸式翻译" width="70%">
-</div>
 
 ## ✨ 未来计划
 

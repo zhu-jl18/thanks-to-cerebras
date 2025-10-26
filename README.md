@@ -157,9 +157,12 @@ sequenceDiagram
 
 - to do
   - [ ] Docker 支持
+  - [x] UI面板
+  - [x] 持久化存储
   - [x] 技术原理解析
   - [x] 模型默认映射
   - [x] 简单鉴权
+
 
 
 

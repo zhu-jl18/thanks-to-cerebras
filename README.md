@@ -118,17 +118,28 @@ Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/comple
 4. **流式透传**
    - 代理不消费/拼接上游返回流，直接把 `apiResponse.body` 透传给客户端，降低延迟与内存占用
 
-下面是“共同处理流水线”的 ASCII UML（版本会在其中增删模块）：
+下面是“共同处理流水线”的 Mermaid（版本会在其中增删模块）：
 
-```text
-IT(沉浸式翻译) -> Proxy(Deno): POST /v1/chat/completions
-Proxy -> Proxy: (可选) 鉴权
-Proxy -> Proxy: (可选) 排队/限流
-Proxy -> Proxy: (可选) 模型名映射
-Proxy -> Proxy: 轮询选择 API Key
-Proxy -> Cerebras: 转发请求 (Authorization: Bearer <key>)
-Cerebras -> Proxy: 流式响应
-Proxy -> IT(沉浸式翻译): 流式返回
+```mermaid
+sequenceDiagram
+    participant IT as 沉浸式翻译
+    participant DP as Deno 代理
+    participant CA as Cerebras API
+
+    IT->>DP: POST /v1/chat/completions
+    opt 鉴权（可选）
+        DP->>DP: 校验 Authorization
+    end
+    opt 排队/限流（可选）
+        DP->>DP: 进入队列/节拍放行
+    end
+    opt 模型名映射（可选）
+        DP->>DP: 将 model 映射为默认模型
+    end
+    DP->>DP: Round-Robin 选择 API Key
+    DP->>CA: 转发请求 (Authorization: Bearer <key>)
+    CA-->>DP: 流式响应
+    DP-->>IT: 流式返回
 ```
 
 ### 版本差异（你该选哪个）

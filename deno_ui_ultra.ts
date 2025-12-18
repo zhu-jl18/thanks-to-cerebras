@@ -5,12 +5,17 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 // 配置常量
 // ================================
 const CEREBRAS_API_URL = 'https://api.cerebras.ai/v1/chat/completions';
-const RATE_LIMIT_MS = 200;
 const AUTH_PASSWORD = (Deno.env.get("AUTH_PASSWORD")?.trim() || '') || null;
 const KV_PREFIX = "cerebras-proxy"; // KV 键前缀
 const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
 const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
 const KV_ATOMIC_MAX_RETRIES = 10;
+const KV_FLUSH_INTERVAL_MS = (() => {
+  const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
+  if (!raw) return 5000;
+  const ms = Number.parseInt(raw, 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 5000;
+})();
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -45,6 +50,18 @@ interface ProxyConfig {
 }
 
 // ================================
+// 运行时缓存（Ultra：热路径不触碰 KV）
+// ================================
+let cachedConfig: ProxyConfig | null = null;
+let cachedKeysById = new Map<string, ApiKey>();
+let cachedActiveKeyIds: string[] = [];
+let cachedCursor = 0;
+const keyCooldownUntil = new Map<string, number>();
+const dirtyKeyIds = new Set<string>();
+let dirtyConfig = false;
+let flushInProgress = false;
+
+// ================================
 // 工具函数
 // ================================
 function generateId(): string {
@@ -76,6 +93,104 @@ function isProxyAuthorized(req: Request): boolean {
 }
 
 // 私有服务，无需鉴权函数
+function rebuildActiveKeyIds(): void {
+  const keys = Array.from(cachedKeysById.values());
+  keys.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+  cachedActiveKeyIds = keys.filter(k => k.status === 'active').map(k => k.id);
+  if (cachedActiveKeyIds.length === 0) {
+    cachedCursor = 0;
+    return;
+  }
+  cachedCursor = cachedCursor % cachedActiveKeyIds.length;
+}
+
+function getCachedConfigOrThrow(): ProxyConfig {
+  if (!cachedConfig) throw new Error("代理未初始化：配置未加载");
+  return cachedConfig;
+}
+
+function getNextApiKeyFast(now: number): { key: string; id: string } | null {
+  if (cachedActiveKeyIds.length === 0) return null;
+
+  for (let offset = 0; offset < cachedActiveKeyIds.length; offset++) {
+    const idx = (cachedCursor + offset) % cachedActiveKeyIds.length;
+    const id = cachedActiveKeyIds[idx];
+    const cooldownUntil = keyCooldownUntil.get(id) ?? 0;
+    if (cooldownUntil > now) continue;
+
+    const keyEntry = cachedKeysById.get(id);
+    if (!keyEntry || keyEntry.status !== 'active') continue;
+
+    cachedCursor = (idx + 1) % cachedActiveKeyIds.length;
+
+    keyEntry.useCount += 1;
+    keyEntry.lastUsed = now;
+    dirtyKeyIds.add(id);
+
+    if (cachedConfig) {
+      cachedConfig.totalRequests += 1;
+      dirtyConfig = true;
+    }
+
+    return { key: keyEntry.key, id };
+  }
+
+  return null;
+}
+
+function markKeyCooldownFrom429(id: string, response: Response): void {
+  const retryAfter = response.headers.get("retry-after")?.trim();
+  const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter) ? Number.parseInt(retryAfter, 10) * 1000 : 2000;
+  keyCooldownUntil.set(id, Date.now() + Math.max(0, retryAfterMs));
+}
+
+function markKeyInvalid(id: string): void {
+  const keyEntry = cachedKeysById.get(id);
+  if (!keyEntry) return;
+  if (keyEntry.status === 'invalid') return;
+  keyEntry.status = 'invalid';
+  dirtyKeyIds.add(id);
+  keyCooldownUntil.delete(id);
+  rebuildActiveKeyIds();
+}
+
+async function flushDirtyToKv(): Promise<void> {
+  if (flushInProgress) return;
+  if (!dirtyConfig && dirtyKeyIds.size === 0) return;
+  if (!cachedConfig) return;
+
+  flushInProgress = true;
+  const keyIds = Array.from(dirtyKeyIds);
+  dirtyKeyIds.clear();
+  const flushConfig = dirtyConfig;
+  dirtyConfig = false;
+
+  try {
+    const tasks: Promise<unknown>[] = [];
+    for (const id of keyIds) {
+      const keyEntry = cachedKeysById.get(id);
+      if (!keyEntry) continue;
+      tasks.push(kv.set([...API_KEY_PREFIX, id], keyEntry));
+    }
+    if (flushConfig) {
+      tasks.push(kv.set(CONFIG_KEY, cachedConfig));
+    }
+    await Promise.all(tasks);
+  } catch (error) {
+    for (const id of keyIds) dirtyKeyIds.add(id);
+    dirtyConfig = dirtyConfig || flushConfig;
+    console.error(`[KV] flush failed:`, error);
+  } finally {
+    flushInProgress = false;
+  }
+}
+
+async function bootstrapCache(): Promise<void> {
+  cachedConfig = await kvGetConfig();
+  const keys = await kvGetAllKeys();
+  cachedKeysById = new Map(keys.map(k => [k.id, k]));
+  rebuildActiveKeyIds();
+}
 
 // ================================
 // KV 存储操作
@@ -109,6 +224,7 @@ async function kvUpdateConfig(updater: (config: ProxyConfig) => ProxyConfig | Pr
     const nextConfig = await updater(entry.value);
     const result = await kv.atomic().check(entry).set(CONFIG_KEY, nextConfig).commit();
     if (result.ok) {
+      cachedConfig = nextConfig;
       return nextConfig;
     }
   }
@@ -125,7 +241,7 @@ async function kvGetAllKeys(): Promise<ApiKey[]> {
 }
 
 async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; error?: string }> {
-  const allKeys = await kvGetAllKeys();
+  const allKeys = Array.from(cachedKeysById.values());
 
   // 检查密钥是否已存在
   const existingKey = allKeys.find(k => k.key === key);
@@ -143,8 +259,10 @@ async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; e
   };
 
   await kv.set([...API_KEY_PREFIX, id], newKey);
+  cachedKeysById.set(id, newKey);
+  rebuildActiveKeyIds();
 
-  console.log(`✅ 添加密钥成功，当前密钥数量: ${(await kvGetAllKeys()).length}`);
+  console.log(`✅ 添加密钥成功，当前密钥数量: ${cachedKeysById.size}`);
 
   return { success: true, id };
 }
@@ -157,73 +275,34 @@ async function kvDeleteKey(id: string): Promise<{ success: boolean; error?: stri
   }
 
   await kv.delete(key);
+  cachedKeysById.delete(id);
+  keyCooldownUntil.delete(id);
+  dirtyKeyIds.delete(id);
+  rebuildActiveKeyIds();
   return { success: true };
 }
 
 async function kvUpdateKey(id: string, updates: Partial<ApiKey>): Promise<void> {
   const key = [...API_KEY_PREFIX, id];
-  const result = await kv.get<ApiKey>(key);
-  if (result.value) {
-    const updated = { ...result.value, ...updates };
-    await kv.set(key, updated);
-  }
-}
-
-async function kvGetNextApiKey(): Promise<{ key: string; id: string } | null> {
-  for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
-    const [configEntry, keys] = await Promise.all([kvEnsureConfigEntry(), kvGetAllKeys()]);
-    const activeKeys = keys.filter(k => k.status === 'active');
-
-    if (activeKeys.length === 0) {
-      return null;
-    }
-
-    const activeIndex = configEntry.value.currentKeyIndex % activeKeys.length;
-    const selectedKey = activeKeys[activeIndex];
-    const selectedEntry = await kv.get<ApiKey>([...API_KEY_PREFIX, selectedKey.id]);
-    if (!selectedEntry.value || selectedEntry.value.status !== 'active') {
-      continue;
-    }
-
-    const newIndex = (activeIndex + 1) % activeKeys.length;
-    const updatedConfig: ProxyConfig = {
-      ...configEntry.value,
-      currentKeyIndex: newIndex,
-      totalRequests: configEntry.value.totalRequests + 1
-    };
-    const updatedKey: ApiKey = {
-      ...selectedEntry.value,
-      useCount: selectedEntry.value.useCount + 1,
-      lastUsed: Date.now()
-    };
-
-    const result = await kv.atomic()
-      .check(configEntry)
-      .check(selectedEntry)
-      .set(CONFIG_KEY, updatedConfig)
-      .set([...API_KEY_PREFIX, selectedKey.id], updatedKey)
-      .commit();
-
-    if (result.ok) {
-      return { key: selectedEntry.value.key, id: selectedEntry.value.id };
-    }
-  }
-
-  throw new Error("获取可用密钥失败：达到最大重试次数");
+  const existing = cachedKeysById.get(id) ?? (await kv.get<ApiKey>(key)).value;
+  if (!existing) return;
+  const updated = { ...existing, ...updates };
+  cachedKeysById.set(id, updated);
+  rebuildActiveKeyIds();
+  await kv.set(key, updated);
 }
 
 // ================================
 // API 密钥管理
 // ================================
 async function testKey(id: string): Promise<{ success: boolean; status: string; error?: string }> {
-  const allKeys = await kvGetAllKeys();
-  const apiKey = allKeys.find(k => k.id === id);
+  const apiKey = cachedKeysById.get(id);
 
   if (!apiKey) {
     return { success: false, status: 'invalid', error: "密钥不存在" };
   }
 
-  const config = await kvGetConfig();
+  const config = getCachedConfigOrThrow();
 
   try {
     const response = await fetch(CEREBRAS_API_URL, {
@@ -269,7 +348,7 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/keys - 获取密钥列表
     if (req.method === 'GET' && path === '/api/keys') {
-      const keys = await kvGetAllKeys();
+      const keys = Array.from(cachedKeysById.values());
       // 隐藏密钥内容，只显示掩码
       const maskedKeys = keys.map(k => ({
         ...k,
@@ -404,7 +483,8 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/stats - 获取统计信息
     if (req.method === 'GET' && path === '/api/stats') {
-      const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
+      const keys = Array.from(cachedKeysById.values());
+      const config = getCachedConfigOrThrow();
       const stats = {
         totalKeys: keys.length,
         activeKeys: keys.filter(k => k.status === 'active').length,
@@ -423,7 +503,7 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/config - 获取配置
     if (req.method === 'GET' && path === '/api/config') {
-      const config = await kvGetConfig();
+      const config = getCachedConfigOrThrow();
       return new Response(JSON.stringify(config), {
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       });
@@ -461,7 +541,7 @@ async function handler(req: Request): Promise<Response> {
 
   // GET /v1/models - OpenAI 兼容的模型列表接口
   if (req.method === 'GET' && path === '/v1/models') {
-    const config = await kvGetConfig();
+    const config = getCachedConfigOrThrow();
     const response = {
       object: "list",
       data: [
@@ -495,20 +575,30 @@ async function handler(req: Request): Promise<Response> {
       const requestBody = await req.json();
 
       // 模型映射
-      const config = await kvGetConfig();
+      const config = getCachedConfigOrThrow();
       const originalModel = requestBody.model;
       requestBody.model = config.defaultModel;
 
       console.log(`[代理] 收到请求，模型映射: ${originalModel} -> ${config.defaultModel}`);
 
-      const apiKeyData = await kvGetNextApiKey();
+      const apiKeyData = getNextApiKeyFast(Date.now());
       if (!apiKeyData) {
-        console.error(`[代理] 没有可用的 API 密钥`);
+        const now = Date.now();
+        const activeIds = cachedActiveKeyIds;
+        const cooldowns = activeIds.map(id => keyCooldownUntil.get(id) ?? 0).filter(ms => ms > now);
+        const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
+        const retryAfterSeconds = minCooldownUntil > now ? Math.ceil((minCooldownUntil - now) / 1000) : 0;
+
+        console.error(`[代理] 没有可用的 API 密钥（无 active 或全部 cooldown）`);
         return new Response(JSON.stringify({
           error: "没有可用的 API 密钥"
         }), {
-          status: 500,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          status: activeIds.length > 0 ? 429 : 500,
+          headers: {
+            ...CORS_HEADERS,
+            "Content-Type": "application/json",
+            ...(retryAfterSeconds > 0 ? { "Retry-After": String(retryAfterSeconds) } : {}),
+          },
         });
       }
 
@@ -524,6 +614,13 @@ async function handler(req: Request): Promise<Response> {
       });
 
       console.log(`[代理] Cerebras 响应状态: ${apiResponse.status}`);
+
+      if (apiResponse.status === 429) {
+        markKeyCooldownFrom429(apiKeyData.id, apiResponse);
+      }
+      if (apiResponse.status === 401 || apiResponse.status === 403) {
+        markKeyInvalid(apiKeyData.id);
+      }
 
       const responseHeaders = new Headers(apiResponse.headers);
       Object.entries(CORS_HEADERS).forEach(([key, value]) => {
@@ -547,7 +644,8 @@ async function handler(req: Request): Promise<Response> {
 
   // 主页
   if (path === '/' && req.method === 'GET') {
-    const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
+    const keys = Array.from(cachedKeysById.values());
+    const config = getCachedConfigOrThrow();
     const stats = {
       totalKeys: keys.length,
       activeKeys: keys.filter(k => k.status === 'active').length,
@@ -1044,10 +1142,15 @@ console.log(`- API 代理: /v1/chat/completions`);
 console.log(`- 默认模型接口: /v1/models`);
 console.log(`- 代理鉴权: ${AUTH_PASSWORD ? '启用' : '未启用'}`);
 console.log(`- 模式: 私有代理服务`);
-console.log(`- 请求间隔: ${RATE_LIMIT_MS}ms`);
+console.log(`- 限流: Ultra 默认关闭（直通，宁可 429）`);
 console.log(`- 存储方式: Deno KV 持久化存储`);
+console.log(`- KV 刷盘间隔: ${KV_FLUSH_INTERVAL_MS}ms`);
 
 // Usage example
 if (import.meta.main) {
+  await bootstrapCache();
+  if (KV_FLUSH_INTERVAL_MS > 0) {
+    setInterval(flushDirtyToKv, KV_FLUSH_INTERVAL_MS);
+  }
   serve(handler);
 }

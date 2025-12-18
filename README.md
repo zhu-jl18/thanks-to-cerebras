@@ -25,6 +25,12 @@ Cerebras 专注于高性能AI推理，免费用户每天可获得 1,000,000 toke
 
 也许可以注册多个 Cerebras 账号获取更多免费额度，项目内置轮询功能。
 
+### 你可能不需要这个项目
+
+Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/completions`）。如果你已经在用带面板/密钥池/轮询/限流的 AI Gateway（例如 NewAPI、gpt-load 等），直接把上游切到 Cerebras 即可。
+
+这个仓库只是一个「个人用、轻量、可快速丢进 Deno Deploy 一键跑起来」的替代实现，主要服务于沉浸式翻译这种高并发小请求场景。
+
 ### 🔗 代码来源
 本项目基于 [linux.do 社区分享](https://linux.do/t/topic/956453) 的代码改进而来。
 
@@ -98,57 +104,58 @@ Cerebras 专注于高性能AI推理，免费用户每天可获得 1,000,000 toke
 
 ## ⚙️ 技术原理
 
-通过代理转发机制，将沉浸式翻译的请求路由至 Cerebras API。
+一句话：把沉浸式翻译（OpenAI 风格请求）原样接进来，在代理里做最少的“管控”（鉴权/模型映射/Key 轮询/可选限流），然后把响应流式转发回去。
 
-### 核心架构
+### 共同原理（所有版本）
 
-```mermaid
-graph TB
-        A[沉浸式翻译插件]
-        A --> B[Deno 代理]
+1. **OpenAI 兼容入口**
+   - 代理对外暴露 `/v1/chat/completions`（以及部分版本提供 `/v1/models`）
+   - 沉浸式翻译只需要把“上游地址”指向你的 Deno 部署地址即可
+2. **CORS 处理**
+   - 允许浏览器侧跨域调用，避免前端被浏览器拦截
+3. **Key 轮询（Round-Robin）**
+   - 代理维护一个 key 池，按请求轮换 key，尽可能把负载平均摊到多个账号/多个 key 上
+4. **流式透传**
+   - 代理不消费/拼接上游返回流，直接把 `apiResponse.body` 透传给客户端，降低延迟与内存占用
 
-        subgraph P[处理流水线]
-            direction LR
-            C{鉴权?}
-            D[排队/限流]
-            E[模型映射]
-            F[密钥轮换]
-        end
+下面是“共同处理流水线”的 ASCII UML（版本会在其中增删模块）：
 
-        B --> C --> D --> E --> F --> G[Cerebras API 推理]
-        G --> H[翻译结果]
-        H --> A
-
-        C -->|未设置/跳过| D
+```text
+IT(沉浸式翻译) -> Proxy(Deno): POST /v1/chat/completions
+Proxy -> Proxy: (可选) 鉴权
+Proxy -> Proxy: (可选) 排队/限流
+Proxy -> Proxy: (可选) 模型名映射
+Proxy -> Proxy: 轮询选择 API Key
+Proxy -> Cerebras: 转发请求 (Authorization: Bearer <key>)
+Cerebras -> Proxy: 流式响应
+Proxy -> IT(沉浸式翻译): 流式返回
 ```
 
-### 关键特性
+### 版本差异（你该选哪个）
 
-- **可选鉴权**：支持通过环境变量设置访问密码
-- **模型映射**：自动将任意模型名映射到指定模型
-- **请求队列**：每200ms处理一个请求，避免速率限制
-- **密钥轮换**：多个API密钥循环使用
-- **错误处理**：异常捕获和CORS跨域支持
-- **流式响应**：保持原始响应流
+| 版本 | 文件 | 适合人群 | Key 来源 | 是否限流/排队 | 模型映射 | 面板 |
+|---|---|---|---|---|---|---|
+| 基础版 | `deno.ts` | 追求最小代码量 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ❌ 无 | ❌ |
+| 增强版（推荐） | `deno_new.ts` | 想要鉴权 + 免配模型名 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ✅ 有（强制映射到默认模型） | ❌ |
+| Ultra（KV 面板） | `deno_ui_ultra.ts` | 想要面板管理 key 池/默认模型，追求 0 等待 | Deno KV（面板持久化） | ❌ 默认关闭（直通，宁可 429） | ✅ 有（映射到面板默认模型） | ✅ |
 
-### 数据流程
+### 限流到底怎么工作（只针对基础/增强版）
 
-```mermaid
-sequenceDiagram
-    participant IT as 沉浸式翻译
-    participant DP as Deno代理
-    participant CA as Cerebras API
+基础/增强版用的是“全局队列 + 固定出队间隔（`RATE_LIMIT_MS`）”。它的意义不是“永远不 429”，而是：当你的 key 数量不多时，通过排队把请求压到一个更稳的速率。
 
-    IT->>DP: POST /v1/chat/completions
-    DP->>DP: 鉴权验证 (可选)
-    DP->>DP: 加入请求队列
-    DP->>DP: 模型名映射
-    DP->>DP: 选择下一个API密钥
-    DP->>CA: 转发请求 + Bearer Token
-    CA->>CA: AI模型处理
-    CA->>DP: 返回翻译结果
-    DP->>IT: 流式返回结果
-```
+如果每个 key 的上限是 `30 rpm`，可以用这个经验公式估算：
+
+- 单 key 间隔：`2000ms/req`（因为 30 rpm = 1 req / 2s）
+- K 个 key 的总节拍上限：`T >= 2000 / K`（T 越小越快，但越可能 429）
+
+例子（只给直觉，不需要你精确算）：
+
+- 1 个 key：`RATE_LIMIT_MS ≈ 2000ms`
+- 2 个 key：`≈ 1000ms`
+- 5 个 key：`≈ 400ms`
+- 10 个 key：`≈ 200ms`
+
+Ultra 默认不做队列：你扔足够多的 key，就用“堆 key”来覆盖吞吐；不够就直接 429（符合沉浸式翻译“宁可失败也不要排队变慢”的体验取向）。
 
 
 

@@ -838,204 +838,207 @@ async function handler(req: Request): Promise<Response> {
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Cerebras 密钥管理系统</title>
+        <title>Cerebras Proxy</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0e17;
             min-height: 100vh;
-            padding: 20px;
+            padding: 40px 20px;
+            color: #e2e8f0;
           }
           .container {
-            max-width: 1200px;
+            max-width: 1100px;
             margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
           }
           .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 30px;
+            margin-bottom: 48px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid rgba(56, 189, 248, 0.1);
           }
           h1 {
-            color: #333;
-            font-size: 28px;
+            font-size: 24px;
+            font-weight: 500;
+            letter-spacing: -0.02em;
+            color: #f1f5f9;
           }
+          h1 span { color: #38bdf8; }
           .stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 48px;
+          }
+          @media (max-width: 768px) {
+            .stats { grid-template-columns: repeat(2, 1fr); }
           }
           .stat-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(56, 189, 248, 0.08);
+            padding: 24px;
             border-radius: 8px;
             text-align: center;
+            transition: border-color 0.2s;
+          }
+          .stat-card:hover {
+            border-color: rgba(56, 189, 248, 0.2);
           }
           .stat-value {
-            font-size: 32px;
-            font-weight: bold;
-            margin-bottom: 5px;
+            font-size: 36px;
+            font-weight: 600;
+            color: #38bdf8;
+            margin-bottom: 8px;
+            letter-spacing: -0.02em;
           }
+          .stat-card:nth-child(4) .stat-value { color: #22d3d8; }
           .stat-label {
-            font-size: 14px;
-            opacity: 0.9;
+            font-size: 13px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
           }
-          .admin-panel {
-            background: #f8f9fa;
+          .section {
+            background: rgba(15, 23, 42, 0.4);
+            border: 1px solid rgba(56, 189, 248, 0.06);
             border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
+            padding: 32px;
+            margin-bottom: 24px;
           }
-          .admin-toggle {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 6px;
-            cursor: pointer;
+          .section-title {
             font-size: 14px;
-          }
-          .admin-toggle:hover {
-            background: #5568d3;
-          }
-          .admin-content {
-            display: none;
-            margin-top: 20px;
-          }
-          .admin-content.active {
-            display: block;
+            font-weight: 500;
+            color: #94a3b8;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
           }
           .form-group {
-            margin-bottom: 15px;
+            margin-bottom: 20px;
           }
           .form-group label {
             display: block;
-            margin-bottom: 5px;
-            color: #333;
+            margin-bottom: 8px;
+            color: #94a3b8;
+            font-size: 13px;
             font-weight: 500;
           }
           .form-control {
             width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
+            padding: 12px 16px;
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(56, 189, 248, 0.1);
             border-radius: 6px;
             font-size: 14px;
+            color: #e2e8f0;
+            font-family: 'Inter', monospace;
+            transition: border-color 0.2s, box-shadow 0.2s;
           }
+          .form-control::placeholder { color: #475569; }
           .form-control:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #38bdf8;
+            box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1);
           }
           textarea.form-control {
             resize: vertical;
             min-height: 100px;
           }
           .btn {
-            background: #667eea;
-            color: white;
-            border: none;
+            background: transparent;
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.3);
             padding: 10px 20px;
             border-radius: 6px;
             cursor: pointer;
-            font-size: 14px;
-            transition: all 0.3s;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+            font-family: 'Inter', sans-serif;
           }
           .btn:hover {
-            background: #5568d3;
+            background: rgba(56, 189, 248, 0.1);
+            border-color: #38bdf8;
           }
           .btn-danger {
-            background: #dc3545;
+            color: #f87171;
+            border-color: rgba(248, 113, 113, 0.3);
           }
           .btn-danger:hover {
-            background: #c82333;
+            background: rgba(248, 113, 113, 0.1);
+            border-color: #f87171;
           }
           .btn-success {
-            background: #28a745;
+            color: #34d399;
+            border-color: rgba(52, 211, 153, 0.3);
           }
           .btn-success:hover {
-            background: #218838;
+            background: rgba(52, 211, 153, 0.1);
+            border-color: #34d399;
           }
-          .keys-list {
-            margin-top: 20px;
+          .divider {
+            height: 1px;
+            background: rgba(56, 189, 248, 0.08);
+            margin: 28px 0;
           }
-          .key-item {
-            background: white;
-            border: 1px solid #ddd;
+          .list-item {
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid rgba(56, 189, 248, 0.06);
             border-radius: 6px;
-            padding: 15px;
-            margin-bottom: 10px;
+            padding: 16px 20px;
+            margin-bottom: 8px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            transition: border-color 0.2s;
           }
-          .key-info {
-            flex: 1;
+          .list-item:hover {
+            border-color: rgba(56, 189, 248, 0.15);
           }
-          .key-masked {
-            font-family: monospace;
-            color: #333;
-            margin-bottom: 5px;
+          .item-info { flex: 1; }
+          .item-primary {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            color: #e2e8f0;
+            font-size: 13px;
+            margin-bottom: 4px;
           }
-          .key-stats {
+          .item-secondary {
             font-size: 12px;
-            color: #666;
+            color: #64748b;
           }
           .status-badge {
             display: inline-block;
-            padding: 3px 8px;
+            padding: 3px 10px;
             border-radius: 4px;
             font-size: 11px;
             font-weight: 500;
-            margin-left: 8px;
+            margin-left: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
           }
-          .status-active { background: #d4edda; color: #155724; }
-          .status-inactive { background: #fff3cd; color: #856404; }
-          .status-invalid { background: #f8d7da; color: #721c24; }
-          .key-actions {
+          .status-active { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+          .status-inactive { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+          .status-invalid { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+          .item-actions {
             display: flex;
-            gap: 10px;
-          }
-          .models-list {
-            margin-top: 20px;
-          }
-          .model-item {
-            background: white;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            padding: 15px;
-            margin-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-          }
-          .model-info {
-            flex: 1;
-          }
-          .model-name {
-            font-family: monospace;
-            color: #333;
-            margin-bottom: 5px;
-          }
-          .model-actions {
-            display: flex;
-            gap: 10px;
+            gap: 8px;
           }
           .notification {
             position: fixed;
-            top: 20px;
-            right: 20px;
-            background: white;
-            border-radius: 8px;
-            padding: 15px 20px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            top: 24px;
+            right: 24px;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            padding: 16px 24px;
             display: none;
             z-index: 1000;
+            backdrop-filter: blur(8px);
+            font-size: 14px;
           }
           .notification.show {
             display: block;
@@ -1045,340 +1048,200 @@ async function handler(req: Request): Promise<Response> {
             from { transform: translateX(100%); opacity: 0; }
             to { transform: translateX(0); opacity: 1; }
           }
-          .notification.success { border-left: 4px solid #28a745; }
-          .notification.error { border-left: 4px solid #dc3545; }
-          .model-config {
-            background: #e7f3ff;
-            border: 1px solid #b3d9ff;
-            border-radius: 6px;
-            padding: 15px;
-            margin-top: 20px;
-          }
-          .model-config h3 {
-            margin-top: 0;
-            color: #0066cc;
-          }
-          .model-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 10px;
-          }
-          .model-tag {
-            background: #667eea;
-            color: white;
-            padding: 5px 12px;
-            border-radius: 4px;
+          .notification.success { color: #34d399; }
+          .notification.error { color: #f87171; }
+          .hint {
             font-size: 12px;
-            cursor: pointer;
-            transition: all 0.2s;
+            color: #475569;
+            margin-top: 16px;
           }
-          .model-tag:hover {
-            background: #5568d3;
-            transform: scale(1.05);
+          .empty-state {
+            text-align: center;
+            padding: 32px;
+            color: #475569;
+            font-size: 14px;
           }
         </style>
       </head>
       <body>
         <div class="container">
           <div class="header">
-            <h1>🔑 Cerebras 密钥管理系统</h1>
-            <button class="admin-toggle" onclick="toggleAdminPanel()">管理面板</button>
+            <h1><span>Cerebras</span> Proxy</h1>
           </div>
 
           <div class="stats">
             <div class="stat-card">
               <div class="stat-value">${stats.totalKeys}</div>
-              <div class="stat-label">总密钥数</div>
+              <div class="stat-label">Total Keys</div>
             </div>
             <div class="stat-card">
               <div class="stat-value">${stats.activeKeys}</div>
-              <div class="stat-label">活跃密钥</div>
+              <div class="stat-label">Active</div>
             </div>
             <div class="stat-card">
               <div class="stat-value">${stats.totalRequests}</div>
-              <div class="stat-label">总请求数</div>
+              <div class="stat-label">Requests</div>
             </div>
-            <div class="stat-card" style="background: linear-gradient(135deg, #34d399 0%, #059669 100%);">
-              <div class="stat-value">${stats.authEnabled ? '已启用' : '未启用'}</div>
-              <div class="stat-label">代理鉴权</div>
+            <div class="stat-card">
+              <div class="stat-value">${stats.authEnabled ? 'ON' : 'OFF'}</div>
+              <div class="stat-label">Auth</div>
             </div>
           </div>
 
-          <div class="admin-panel">
-            <button class="admin-toggle" onclick="toggleAdminPanel()">🔧 密钥管理</button>
-            <div id="adminContent" class="admin-content active">
-              <div class="form-group">
-                <label>🔑 单个密钥添加</label>
-                <input type="text" id="singleKey" class="form-control" placeholder="输入 API 密钥">
-                <button class="btn" onclick="addSingleKey()" style="margin-top: 10px;">添加密钥</button>
-              </div>
-
-              <hr style="margin: 20px 0; border: none; border-top: 1px solid #ddd;">
-
-              <div class="form-group">
-                <label>📦 批量导入密钥</label>
-                <textarea id="batchKeys" class="form-control" placeholder="支持换行、逗号或空格分隔"></textarea>
-                <button class="btn" onclick="addBatchKeys()" style="margin-top: 10px;">批量导入</button>
-              </div>
-
-              <div class="model-config">
-                <h3>⚙️ 模型池管理</h3>
-                <p style="margin-bottom: 10px; color: #666;">请求会 Round-Robin 轮询以下模型，分散 TPM 压力</p>
-                <div class="form-group">
-                  <label>添加模型</label>
-                  <input type="text" id="newModel" class="form-control" placeholder="输入模型名称（如 gpt-oss-120b）">
-                  <button class="btn" onclick="addModel()" style="margin-top: 10px;">添加模型</button>
-                </div>
-                <div class="models-list" id="modelsList" style="margin-top: 15px;">
-                  <h4 style="margin-bottom: 10px;">当前模型池</h4>
-                  <div id="modelsContainer"></div>
-                </div>
-                <p style="margin-top: 15px; font-size: 12px; color: #666;">
-                  💡 任意客户端模型名都会映射到池中轮询的模型，可扩展 TPM 上限
-                </p>
-              </div>
-
-              <div class="keys-list" id="keysList">
-                <h3 style="margin-bottom: 15px;">密钥列表</h3>
-                <div id="keysContainer"></div>
-              </div>
+          <div class="section">
+            <div class="section-title">Key Management</div>
+            <div class="form-group">
+              <label>Add Single Key</label>
+              <input type="text" id="singleKey" class="form-control" placeholder="Enter API key">
+              <button class="btn" onclick="addSingleKey()" style="margin-top: 12px;">Add Key</button>
             </div>
+
+            <div class="divider"></div>
+
+            <div class="form-group">
+              <label>Batch Import</label>
+              <textarea id="batchKeys" class="form-control" placeholder="Separate keys by newline, comma, or space"></textarea>
+              <button class="btn" onclick="addBatchKeys()" style="margin-top: 12px;">Import</button>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Model Pool</div>
+            <p class="hint" style="margin-top: 0; margin-bottom: 16px;">Round-robin rotation across models to distribute TPM load</p>
+            <div class="form-group">
+              <label>Add Model</label>
+              <input type="text" id="newModel" class="form-control" placeholder="e.g. gpt-oss-120b">
+              <button class="btn" onclick="addModel()" style="margin-top: 12px;">Add Model</button>
+            </div>
+            <div class="divider"></div>
+            <div id="modelsContainer"></div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Keys</div>
+            <div id="keysContainer"></div>
           </div>
 
           <div class="notification" id="notification"></div>
         </div>
 
         <script>
-          let adminVisible = true;
-
-          function toggleAdminPanel() {
-            adminVisible = !adminVisible;
-            const content = document.getElementById('adminContent');
-            content.classList.toggle('active', adminVisible);
-            if (adminVisible) {
-              loadKeys();
-              loadModels();
-            }
-          }
-
           function showNotification(message, type = 'success') {
             const notif = document.getElementById('notification');
             notif.textContent = message;
             notif.className = 'notification show ' + type;
-            setTimeout(() => {
-              notif.classList.remove('show');
-            }, 3000);
+            setTimeout(() => notif.classList.remove('show'), 3000);
           }
 
           async function addSingleKey() {
             const key = document.getElementById('singleKey').value.trim();
-            if (!key) {
-              showNotification('请输入密钥', 'error');
-              return;
-            }
-
+            if (!key) { showNotification('Please enter a key', 'error'); return; }
             try {
-              const response = await fetch('/api/keys', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key }),
-              });
-              const data = await response.json();
-              if (data.success) {
-                showNotification('密钥添加成功');
-                document.getElementById('singleKey').value = '';
-                // 延迟刷新确保数据已保存
-                setTimeout(() => loadKeys(), 500);
-              } else {
-                showNotification(data.error || '添加失败', 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+              const data = await res.json();
+              if (data.success) { showNotification('Key added'); document.getElementById('singleKey').value = ''; setTimeout(loadKeys, 300); }
+              else showNotification(data.error || 'Failed', 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
           async function addBatchKeys() {
             const input = document.getElementById('batchKeys').value.trim();
-            if (!input) {
-              showNotification('请输入密钥', 'error');
-              return;
-            }
-
+            if (!input) { showNotification('Please enter keys', 'error'); return; }
             try {
-              const response = await fetch('/api/keys/batch', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ input }),
-              });
-              const data = await response.json();
-              if (data.summary) {
-                showNotification(\`批量导入完成: 成功 \${data.summary.success} 个，失败 \${data.summary.failed} 个\`);
-                document.getElementById('batchKeys').value = '';
-                // 延迟刷新确保数据已保存
-                setTimeout(() => loadKeys(), 500);
-              } else {
-                showNotification(data.error || '导入失败', 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/keys/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input }) });
+              const data = await res.json();
+              if (data.summary) { showNotification(\`Imported: \${data.summary.success} success, \${data.summary.failed} failed\`); document.getElementById('batchKeys').value = ''; setTimeout(loadKeys, 300); }
+              else showNotification(data.error || 'Failed', 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
           async function loadKeys() {
             try {
-              const response = await fetch('/api/keys');
-              const data = await response.json();
+              const res = await fetch('/api/keys');
+              const data = await res.json();
               const container = document.getElementById('keysContainer');
-              container.innerHTML = '';
-
-              if (data.keys && data.keys.length > 0) {
-                data.keys.forEach(keyData => {
-                  const item = document.createElement('div');
-                  item.className = 'key-item';
-                  item.innerHTML = \`
-                    <div class="key-info">
-                      <div class="key-masked">\${keyData.key}</div>
-                      <div class="key-stats">
-                        使用次数: \${keyData.useCount}
-                        <span class="status-badge status-\${keyData.status}">\${keyData.status}</span>
-                      </div>
+              if (data.keys?.length > 0) {
+                container.innerHTML = data.keys.map(k => \`
+                  <div class="list-item">
+                    <div class="item-info">
+                      <div class="item-primary">\${k.key}<span class="status-badge status-\${k.status}">\${k.status}</span></div>
+                      <div class="item-secondary">Used: \${k.useCount}</div>
                     </div>
-                    <div class="key-actions">
-                      <button class="btn btn-success" onclick="testKey('\${keyData.id}')">测试</button>
-                      <button class="btn btn-danger" onclick="deleteKey('\${keyData.id}')">删除</button>
+                    <div class="item-actions">
+                      <button class="btn btn-success" onclick="testKey('\${k.id}')">Test</button>
+                      <button class="btn btn-danger" onclick="deleteKey('\${k.id}')">Delete</button>
                     </div>
-                  \`;
-                  container.appendChild(item);
-                });
-              } else {
-                container.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">暂无密钥</p>';
-              }
-            } catch (error) {
-              showNotification('加载密钥失败: ' + error.message, 'error');
-            }
+                  </div>\`).join('');
+              } else container.innerHTML = '<div class="empty-state">No keys configured</div>';
+            } catch (e) { showNotification('Load failed: ' + e.message, 'error'); }
           }
 
           async function loadModels() {
             try {
-              const response = await fetch('/api/models');
-              const data = await response.json();
+              const res = await fetch('/api/models');
+              const data = await res.json();
               const container = document.getElementById('modelsContainer');
-              container.innerHTML = '';
-
-              if (data.models && data.models.length > 0) {
-                data.models.forEach(model => {
-                  const item = document.createElement('div');
-                  item.className = 'model-item';
-                  item.innerHTML = \`
-                    <div class="model-info">
-                      <div class="model-name">\${model}</div>
+              if (data.models?.length > 0) {
+                container.innerHTML = data.models.map(m => \`
+                  <div class="list-item">
+                    <div class="item-info"><div class="item-primary">\${m}</div></div>
+                    <div class="item-actions">
+                      <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}')">Test</button>
+                      <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(m)}')">Delete</button>
                     </div>
-                    <div class="model-actions">
-                      <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(model)}')">测试</button>
-                      <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(model)}')">删除</button>
-                    </div>
-                  \`;
-                  container.appendChild(item);
-                });
-              } else {
-                container.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">暂无模型，将使用默认回退模型</p>';
-              }
-            } catch (error) {
-              showNotification('加载模型池失败: ' + error.message, 'error');
-            }
+                  </div>\`).join('');
+              } else container.innerHTML = '<div class="empty-state">No models, using fallback</div>';
+            } catch (e) { showNotification('Load failed: ' + e.message, 'error'); }
           }
 
           async function addModel() {
             const model = document.getElementById('newModel').value.trim();
-            if (!model) {
-              showNotification('请输入模型名称', 'error');
-              return;
-            }
-
+            if (!model) { showNotification('Please enter model name', 'error'); return; }
             try {
-              const response = await fetch('/api/models', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model }),
-              });
-              const data = await response.json();
-              if (data.success) {
-                showNotification(\`模型添加成功: \${data.model}\`);
-                document.getElementById('newModel').value = '';
-                loadModels();
-              } else {
-                showNotification(data.error || '添加失败', 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) });
+              const data = await res.json();
+              if (data.success) { showNotification('Model added: ' + data.model); document.getElementById('newModel').value = ''; loadModels(); }
+              else showNotification(data.error || 'Failed', 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
-          async function deleteModel(encodedName) {
-            if (!confirm('确定要删除这个模型吗？')) return;
-
+          async function deleteModel(name) {
+            if (!confirm('Delete this model?')) return;
             try {
-              const response = await fetch(\`/api/models/\${encodedName}\`, { method: 'DELETE' });
-              const data = await response.json();
-              if (data.success) {
-                showNotification('模型删除成功');
-                loadModels();
-              } else {
-                showNotification(data.error || '删除失败', 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/models/' + name, { method: 'DELETE' });
+              const data = await res.json();
+              if (data.success) { showNotification('Model deleted'); loadModels(); }
+              else showNotification(data.error || 'Failed', 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
-          async function testModel(encodedName) {
+          async function testModel(name) {
             try {
-              const response = await fetch(\`/api/models/\${encodedName}/test\`, { method: 'POST' });
-              const data = await response.json();
-              if (data.success) {
-                showNotification('模型测试成功: ' + data.status);
-              } else {
-                showNotification('模型测试失败: ' + (data.error || data.status), 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/models/' + name + '/test', { method: 'POST' });
+              const data = await res.json();
+              showNotification(data.success ? 'Model OK: ' + data.status : 'Model failed: ' + (data.error || data.status), data.success ? 'success' : 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
           async function deleteKey(id) {
-            if (!confirm('确定要删除这个密钥吗？')) return;
-
+            if (!confirm('Delete this key?')) return;
             try {
-              const response = await fetch(\`/api/keys/\${id}\`, { method: 'DELETE' });
-              const data = await response.json();
-              if (data.success) {
-                showNotification('密钥删除成功');
-                loadKeys();
-              } else {
-                showNotification(data.error || '删除失败', 'error');
-              }
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+              const res = await fetch('/api/keys/' + id, { method: 'DELETE' });
+              const data = await res.json();
+              if (data.success) { showNotification('Key deleted'); loadKeys(); }
+              else showNotification(data.error || 'Failed', 'error');
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
           async function testKey(id) {
             try {
-              const response = await fetch(\`/api/keys/\${id}/test\`, { method: 'POST' });
-              const data = await response.json();
-              if (data.success) {
-                showNotification('密钥测试成功: ' + data.status);
-              } else {
-                showNotification('密钥测试失败: ' + (data.error || data.status), 'error');
-              }
+              const res = await fetch('/api/keys/' + id + '/test', { method: 'POST' });
+              const data = await res.json();
+              showNotification(data.success ? 'Key OK: ' + data.status : 'Key failed: ' + (data.error || data.status), data.success ? 'success' : 'error');
               loadKeys();
-            } catch (error) {
-              showNotification('请求失败: ' + error.message, 'error');
-            }
+            } catch (e) { showNotification('Error: ' + e.message, 'error'); }
           }
 
-          // 初始加载
           loadKeys();
           loadModels();
         </script>

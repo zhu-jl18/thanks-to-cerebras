@@ -20,9 +20,9 @@
 
 ```
 .
-├── deno.ts              # 基础版代理（环境变量配置）
-├── deno_new.ts          # 增强版代理（鉴权+模型映射）
-├── deno_ui_ultra.ts     # Ultra 持久化版（Deno KV + Web 管理面板）
+├── deno-v1.ts           # 基础版代理（环境变量配置）
+├── deno-v2.ts           # 增强版代理（鉴权+模型映射）
+├── deno-v3.ts           # Ultra 持久化版（Deno KV + Web 管理面板）
 ├── README.md            # 用户文档
 ├── KV_DEPLOYMENT_GUIDE.md  # Ultra 版部署指南
 └── .claude/             # Claude Code 配置
@@ -30,7 +30,7 @@
 
 ### 三个版本对比
 
-| 功能 | deno.ts | deno_new.ts | deno_ui_ultra.ts |
+| 功能 | deno-v1.ts | deno-v2.ts | deno-v3.ts |
 |------|---------|-------------|------------------|
 | 密钥轮换 | ✅ | ✅ | ✅ |
 | 请求限流 | ✅ | ✅ | ❌（默认直通，宁可 429） |
@@ -64,16 +64,16 @@
 ```bash
 # 运行基础版（需要先设置环境变量）
 $env:CEREBRAS_API_KEYS="key1,key2,key3"
-deno run --allow-net --allow-env deno.ts
+deno run --allow-net --allow-env deno-v1.ts
 
 # 运行增强版（可选鉴权）
 $env:CEREBRAS_API_KEYS="key1,key2,key3"
 $env:AUTH_PASSWORD="your-password"
-deno run --allow-net --allow-env deno_new.ts
+deno run --allow-net --allow-env deno-v2.ts
 
 # 运行 Ultra 版（需要 KV 权限）
 $env:AUTH_PASSWORD="your-password"  # 可选
-deno run --allow-net --allow-env --unstable-kv deno_ui_ultra.ts
+deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 ```
 
 ### 部署

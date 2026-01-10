@@ -1,14 +1,14 @@
 # Cerebras KV 持久化部署指南 v2.1
 
 ## 核心要点
-- 服务入口是 `deno_ui_ultra.ts`，部署到 Deno Deploy 即完成后端与前端一体化交付。
+- 服务入口是 `deno-v3.ts`，部署到 Deno Deploy 即完成后端与前端一体化交付。
 - 所有密钥与配置持久化在 Deno KV；代理转发的热路径使用内存缓存做 Key 轮询，KV 只负责后台持久化（默认异步刷盘）。
 - 管理面板默认开放；代理鉴权通过可选环境变量 `AUTH_PASSWORD` 控制。
 - 部署完成后同时提供 `/` 管理界面、`/v1/chat/completions` 代理和 `/v1/models` 列表接口。
 
 ## 前置准备
 - Deno Deploy 账号：https://dash.deno.com/ 注册并登录。
-- 最新版 `deno_ui_ultra.ts`：确保使用仓库当前版本。
+- 最新版 `deno-v3.ts`：确保使用仓库当前版本。
 - Cerebras API 密钥若干，确认可用。
 - 可选代理口令：若需对外限制访问，预先决定 `AUTH_PASSWORD`。
 
@@ -18,7 +18,7 @@
 - 若复用旧项目，先确认无历史 KV 数据需求；旧版本数据无法自动迁移。
 
 ### 2. 粘贴源码
-- 将 `deno_ui_ultra.ts` 整体拷贝到在线编辑器。
+- 将 `deno-v3.ts` 整体拷贝到在线编辑器。
 - 保存后点击 “Deploy” 触发首次发布。
 
 ### 3. 配置环境变量（可选）

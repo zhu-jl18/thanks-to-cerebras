@@ -45,7 +45,7 @@ Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/comple
      * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
 1.  **部署到 Deno**:
     *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
-    *   把`deno.ts` 的代码粘贴进去。
+    *   把`deno-v1.ts` 的代码粘贴进去。
 2.  **配置环境变量**:
     *   添加 `CEREBRAS_API_KEYS`。
     *   值填写 Cerebras Key，多个用英文逗号 `,` 分隔，不要留空。
@@ -60,7 +60,7 @@ Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/comple
      * 点击 [Cerebras官网](https://www.cerebras.ai/) 找右上角。
 2.  **部署到 Deno**:
     *   打开 [Deno Deploy](https://dash.deno.com/) 并新建`Playground`。
-    *   把`deno_new.ts` 的代码粘贴进去。
+    *   把`deno-v2.ts` 的代码粘贴进去。
 3.  **配置环境变量**:
     *   **必填**: 添加 `CEREBRAS_API_KEYS`，值填写 Cerebras Key，多个用英文逗号 `,` 分隔。
     *   **可选**: 添加 `AUTH_PASSWORD`，设置鉴权密码（不设置则无鉴权）。
@@ -79,7 +79,7 @@ Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/comple
    * 同前两版，前往 [Cerebras 官网](https://www.cerebras.ai/) 申请并收集可用密钥。
 2. **部署到 Deno**：
    * 在 [Deno Deploy](https://dash.deno.com/) 创建部署。
-   * 将仓库中的 `deno_ui_ultra.ts` 粘贴至在线编辑器并部署。
+   * 将仓库中的 `deno-v3.ts` 粘贴至在线编辑器并部署。
 3. **配置环境变量**：
    * **可选**：设置 `AUTH_PASSWORD`，开启代理鉴权；留空则对外无鉴权。
    * Ultra 版的密钥池与默认模型由 Web 管理面板持久化到 Deno KV，无需环境变量维护。
@@ -146,9 +146,9 @@ sequenceDiagram
 
 | 版本 | 文件 | 适合人群 | Key 来源 | 是否限流/排队 | 模型映射 | 面板 |
 |---|---|---|---|---|---|---|
-| 基础版 | `deno.ts` | 追求最小代码量 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ❌ 无 | ❌ |
-| 增强版（推荐） | `deno_new.ts` | 想要鉴权 + 免配模型名 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ✅ 有（强制映射到默认模型） | ❌ |
-| Ultra（KV 面板） | `deno_ui_ultra.ts` | 想要面板管理 key 池/默认模型，追求 0 等待 | Deno KV（面板持久化） | ❌ 默认关闭（直通，宁可 429） | ✅ 有（映射到面板默认模型） | ✅ |
+| 基础版 | `deno-v1.ts` | 追求最小代码量 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ❌ 无 | ❌ |
+| 增强版（推荐） | `deno-v2.ts` | 想要鉴权 + 免配模型名 | 环境变量 `CEREBRAS_API_KEYS` | ✅ 有（固定节拍队列） | ✅ 有（强制映射到默认模型） | ❌ |
+| Ultra（KV 面板） | `deno-v3.ts` | 想要面板管理 key 池/默认模型，追求 0 等待 | Deno KV（面板持久化） | ❌ 默认关闭（直通，宁可 429） | ✅ 有（映射到面板默认模型） | ✅ |
 
 ### 限流到底怎么工作（只针对基础/增强版）
 

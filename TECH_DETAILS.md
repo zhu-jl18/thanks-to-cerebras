@@ -4,6 +4,7 @@
 - `/v1/models` 是给 OpenAI 风格客户端看的“可选模型列表”。v4 对外只暴露一个虚拟模型：`cerebras-translator`。
 - `/v1/chat/completions` 会忽略请求端传入的 `model`，始终按内部 `modelPool` 做 Round-Robin 轮询并转发到 Cerebras。
 - 统计（`totalRequests` / `useCount` / `lastUsed`）默认会写入 KV，但不影响 Cerebras token 配额；可能影响 Deno KV 的写入额度。对个人项目（5~10 keys、每天用 1 小时左右）通常问题不大。
+- 面板与 `/api/stats` 每次从 KV 读取，避免 Deno Deploy 多实例/多 isolate 时读到不同内存缓存导致数据显示跳变；统计写回仍是最终一致（受刷盘间隔影响）。
 
 ## 1. /v1/models：对外“虚拟模型名”，对内轮询真实模型池
 ### 1.1 为什么只返回一个模型
@@ -47,7 +48,7 @@ v4 内部已经决定：真实模型由代理层轮询选择。此时如果把�
 
 ### 2.3 持久化语义
 - 每次请求会在内存里推进 `currentModelIndex`，并标记 config dirty。
-- 按 `KV_FLUSH_INTERVAL_MS`（默认 5000ms）批量写回 KV。
+- 按 `KV_FLUSH_INTERVAL_MS`（默认 15000ms，可用环境变量覆盖）批量写回 KV。
 
 注意：这类“批量刷盘”持久化是 **最终一致** 的：
 - 正常情况下重启后轮询进度会接近重启前状态
@@ -77,20 +78,20 @@ v4 内部已经决定：真实模型由代理层轮询选择。此时如果把�
 KV 写入只会在“有请求 + 有 dirty 数据”时发生；没有请求时 flush 会直接 return，不产生写入。
 
 ## 4. KV 写入量粗估（给你建立直觉）
-默认每 5 秒 flush 一次。
+默认每 15 秒 flush 一次。
 
 每个 flush 周期内，写入次数大致是：
 - `U + 1`
-  - `U`：这 5 秒内被用到过的 key 数量（dirtyKeyIds）
+  - `U`：这个 flush 周期内被用到过的 key 数量（dirtyKeyIds）
   - `+1`：config（totalRequests / currentModelIndex 等）
 
 个人项目常见：5~10 个 key、每天用 1 小时左右。
-- 5 keys：最坏 `6 次写入/5s` ≈ 72 次/分钟 ≈ 4320 次/小时
-- 10 keys：最坏 `11 次写入/5s` ≈ 132 次/分钟 ≈ 7920 次/小时
+- 5 keys：最坏 `6 次写入/15s` ≈ 24 次/分钟 ≈ 1440 次/小时
+- 10 keys：最坏 `11 次写入/15s` ≈ 44 次/分钟 ≈ 2640 次/小时
 
 通常实际会更低（取决于真实请求量、5 秒内是否轮到所有 key）。
 
 如果你未来 key 规模变大或担心 KV 写入额度：
-- 保持默认 `KV_FLUSH_INTERVAL_MS=5000` 先跑（大多数人没问题）
+- 保持默认 `KV_FLUSH_INTERVAL_MS=15000` 先跑（大多数人没问题）
 - 需要时可把 `KV_FLUSH_INTERVAL_MS` 调大（比如 30000/60000）
 - 或设为 `0` 关闭刷盘（统计将不持久化，重启后会回退/丢失）

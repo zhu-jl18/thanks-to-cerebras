@@ -10,17 +10,24 @@ const KV_PREFIX = "cerebras-proxy"; // KV 键前缀
 const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
 const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
 const KV_ATOMIC_MAX_RETRIES = 10;
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const KV_FLUSH_INTERVAL_MS = (() => {
   const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
-  if (!raw) return 5000;
+  if (!raw) return DEFAULT_KV_FLUSH_INTERVAL_MS;
   const ms = Number.parseInt(raw, 10);
-  return Number.isFinite(ms) && ms >= 0 ? ms : 5000;
+  return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_KV_FLUSH_INTERVAL_MS;
 })();
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, DELETE, PUT',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+const NO_CACHE_HEADERS = {
+  "Cache-Control": "no-store, max-age=0",
+  "Pragma": "no-cache",
+  "Expires": "0",
 };
 
 // ================================
@@ -430,14 +437,14 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/keys - 获取密钥列表
     if (req.method === 'GET' && path === '/api/keys') {
-      const keys = Array.from(cachedKeysById.values());
+      const keys = await kvGetAllKeys();
       // 隐藏密钥内容，只显示掩码
       const maskedKeys = keys.map(k => ({
         ...k,
         key: maskApiKey(k.key),
       }));
       return new Response(JSON.stringify({ keys: maskedKeys }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
       });
     }
 
@@ -565,8 +572,7 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/stats - 获取统计信息
     if (req.method === 'GET' && path === '/api/stats') {
-      const keys = Array.from(cachedKeysById.values());
-      const config = getCachedConfigOrThrow();
+      const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
       const stats = {
         totalKeys: keys.length,
         activeKeys: keys.filter(k => k.status === 'active').length,
@@ -579,15 +585,15 @@ async function handler(req: Request): Promise<Response> {
         })),
       };
       return new Response(JSON.stringify(stats), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
       });
     }
 
     // GET /api/config - 获取配置
     if (req.method === 'GET' && path === '/api/config') {
-      const config = getCachedConfigOrThrow();
+      const config = await kvGetConfig();
       return new Response(JSON.stringify(config), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
       });
     }
 
@@ -597,8 +603,10 @@ async function handler(req: Request): Promise<Response> {
 
     // GET /api/models - 获取模型池列表
     if (req.method === 'GET' && path === '/api/models') {
-      return new Response(JSON.stringify({ models: cachedModelPool }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      const config = await kvGetConfig();
+      const models = config.modelPool && config.modelPool.length > 0 ? config.modelPool : DEFAULT_MODEL_POOL;
+      return new Response(JSON.stringify({ models }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
       });
     }
 
@@ -823,8 +831,7 @@ async function handler(req: Request): Promise<Response> {
 
   // 主页
   if (path === '/' && req.method === 'GET') {
-    const keys = Array.from(cachedKeysById.values());
-    const config = getCachedConfigOrThrow();
+    const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
     const stats = {
       totalKeys: keys.length,
       activeKeys: keys.filter(k => k.status === 'active').length,
@@ -1248,7 +1255,7 @@ async function handler(req: Request): Promise<Response> {
       </body>
       </html>
     `, {
-      headers: { "Content-Type": "text/html" },
+      headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/html" },
     });
   }
 

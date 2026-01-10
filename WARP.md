@@ -7,7 +7,7 @@
 这是一个 Cerebras API 代理转发项目，专为沉浸式翻译设计。通过代理机制将翻译请求路由至 Cerebras 免费 AI 推理服务，支持多 API 密钥轮换和请求限流。
 
 **核心特性：**
-- 三个部署版本：基础版、增强版（支持鉴权+模型映射）、Ultra 持久化版（KV 管理面板）
+- 四个部署版本：基础版、增强版（支持鉴权+模型映射）、Ultra v3（KV 面板，单默认模型）、Ultra v4（KV 面板 + 模型池轮询）
 - API 密钥池管理与轮询
 - 基础/增强版请求限流（固定节拍队列，适合 key 少的情况）
 - 可选密码鉴权
@@ -22,22 +22,23 @@
 .
 ├── deno-v1.ts           # 基础版代理（环境变量配置）
 ├── deno-v2.ts           # 增强版代理（鉴权+模型映射）
-├── deno-v3.ts           # Ultra 持久化版（Deno KV + Web 管理面板）
+├── deno-v3.ts           # Ultra v3（Deno KV + Web 管理面板，单默认模型）
+├── deno-v4.ts           # Ultra v4（Deno KV + Web 管理面板，模型池轮询）
 ├── README.md            # 用户文档
 ├── KV_DEPLOYMENT_GUIDE.md  # Ultra 版部署指南
 └── .claude/             # Claude Code 配置
 ```
 
-### 三个版本对比
+### 四个版本对比
 
-| 功能 | deno-v1.ts | deno-v2.ts | deno-v3.ts |
-|------|---------|-------------|------------------|
-| 密钥轮换 | ✅ | ✅ | ✅ |
-| 请求限流 | ✅ | ✅ | ❌（默认直通，宁可 429） |
-| 鉴权保护 | ❌ | ✅ 可选 | ✅ 可选 |
-| 模型映射 | ❌ | ✅ | ✅ |
-| 持久化存储 | ❌ | ❌ | ✅ Deno KV |
-| Web 管理面板 | ❌ | ❌ | ✅ |
+| 功能 | deno-v1.ts | deno-v2.ts | deno-v3.ts | deno-v4.ts |
+|------|---------|-------------|------------------|------------------|
+| 密钥轮换 | ✅ | ✅ | ✅ | ✅ |
+| 请求限流 | ✅ | ✅ | ❌（默认直通，宁可 429） | ❌（默认直通，宁可 429） |
+| 鉴权保护 | ❌ | ✅ 可选 | ✅ 可选 | ✅ 可选 |
+| 模型映射 | ❌ | ✅ | ✅（单默认模型） | ✅（对内模型池轮询） |
+| 持久化存储 | ❌ | ❌ | ✅ Deno KV | ✅ Deno KV |
+| Web 管理面板 | ❌ | ❌ | ✅ | ✅ |
 
 ### 关键技术要点
 
@@ -51,7 +52,8 @@
 
 **3. 模型映射**
 - 增强版：硬编码默认模型 `qwen-3-235b-a22b-instruct-2507`
-- Ultra 版：默认模型写入 KV，同时缓存在内存中，转发时直接读取缓存
+- Ultra v3：默认模型写入 KV，同时缓存在内存中，转发时直接读取缓存
+- Ultra v4：真实模型由代理按模型池轮询选择；对外只暴露一个虚拟模型名
 
 **4. 鉴权方式**
 - 环境变量 `AUTH_PASSWORD`：设置后强制 Bearer token 验证
@@ -74,6 +76,10 @@ deno run --allow-net --allow-env deno-v2.ts
 # 运行 Ultra 版（需要 KV 权限）
 $env:AUTH_PASSWORD="your-password"  # 可选
 deno run --allow-net --allow-env --unstable-kv deno-v3.ts
+
+# 运行 Ultra v4（需要 KV 权限）
+$env:AUTH_PASSWORD="your-password"  # 可选
+deno run --allow-net --allow-env --unstable-kv deno-v4.ts
 ```
 
 ### 部署
@@ -98,7 +104,7 @@ deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 ### 管理接口（仅 Ultra 版）
 
 - **GET** `/` - Web 管理面板首页
-- **GET** `/v1/models` - 返回默认模型信息（OpenAI 兼容）
+- **GET** `/v1/models` - 返回模型列表（OpenAI 兼容；v4 对外只暴露一个虚拟模型名）
 - **GET** `/api/keys` - 获取密钥列表（掩码显示）
 - **POST** `/api/keys` - 添加单个密钥
 - **POST** `/api/keys/batch` - 批量导入密钥（换行/逗号/空格分隔）
@@ -106,7 +112,11 @@ deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 - **POST** `/api/keys/:id/test` - 测试密钥有效性
 - **GET** `/api/stats` - 获取统计信息
 - **GET** `/api/config` - 获取当前配置
-- **PUT** `/api/config/default-model` - 更新默认模型
+- **PUT** `/api/config/default-model` - 更新默认模型（仅 v3）
+- **GET** `/api/models` - 获取模型池列表（仅 v4）
+- **POST** `/api/models` - 添加单个模型（仅 v4）
+- **DELETE** `/api/models/:name` - 删除指定模型（仅 v4）
+- **POST** `/api/models/:name/test` - 测试模型可用性（仅 v4）
 
 ## 配置与环境变量
 
@@ -120,11 +130,11 @@ deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 
 ### 可选环境变量（Ultra 版）
 
-- `KV_FLUSH_INTERVAL_MS` - 统计信息刷盘间隔（默认 5000ms；设为 `0` 可关闭）
+- `KV_FLUSH_INTERVAL_MS` - 统计信息刷盘间隔（v4 默认 15000ms；设为 `0` 可关闭）
 
 ### Ultra 版特殊说明
 
-- 密钥池和默认模型通过 Web 管理面板持久化到 Deno KV
+- 密钥池和默认模型/模型池通过 Web 管理面板持久化到 Deno KV
 - 首次部署后无需 `CEREBRAS_API_KEYS` 环境变量
 - Deno Deploy 自动提供 KV 存储，本地测试可指定 `DENO_KV_PATH`
 
@@ -163,7 +173,8 @@ deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 ```typescript
 // 配置键
 [KV_PREFIX, "meta", "config"] → ProxyConfig {
-  defaultModel: string,
+  modelPool: string[],
+  currentModelIndex: number,
   currentKeyIndex: number,
   totalRequests: number,
   schemaVersion: string
@@ -186,7 +197,8 @@ deno run --allow-net --allow-env --unstable-kv deno-v3.ts
 
 1. **基础版**: 不支持模型映射，需在客户端直接指定 Cerebras 支持的模型
 2. **增强版**: 修改 `DEFAULT_MODEL` 常量（第 5 行）
-3. **Ultra 版**: 通过 Web 面板或 API `/api/config/default-model` 更新
+3. **Ultra v3**: 通过 Web 面板或 API `/api/config/default-model` 更新默认模型
+4. **Ultra v4**: 通过 Web 面板的“模型池”或 API `/api/models` 增删模型池
 
 ### 修改请求限流策略
 

@@ -38,6 +38,9 @@ Desktop.ini
 *.sublime-workspace
 *.sublime-project
 
+# Claude / Codex local artifacts
+.claude/skills/
+
 # ===================================================================
 # LOGS & DEPENDENCIES
 # 忽略日志文件、依赖缓存和构建产物

@@ -58,6 +58,7 @@ const DEFAULT_MODEL_POOL = [
   'zai-glm-4.7',
 ];
 const FALLBACK_MODEL = 'qwen-3-235b-a22b-instruct-2507';
+const EXTERNAL_MODEL_ID = 'cerebras-translator';
 
 // ================================
 // 运行时缓存（Ultra：热路径不触碰 KV）
@@ -173,8 +174,15 @@ function getNextModelFast(): string {
   if (cachedModelPool.length === 0) {
     return FALLBACK_MODEL;
   }
-  const model = cachedModelPool[modelCursor % cachedModelPool.length];
-  modelCursor = (modelCursor + 1) % cachedModelPool.length;
+  const idx = modelCursor % cachedModelPool.length;
+  const model = cachedModelPool[idx];
+  modelCursor = (idx + 1) % cachedModelPool.length;
+
+  if (cachedConfig) {
+    cachedConfig.currentModelIndex = modelCursor;
+    dirtyConfig = true;
+  }
+
   return model;
 }
 
@@ -715,12 +723,14 @@ async function handler(req: Request): Promise<Response> {
     const now = Math.floor(Date.now() / 1000);
     const response = {
       object: "list",
-      data: cachedModelPool.map(model => ({
-        id: model,
-        object: "model",
-        created: now,
-        owned_by: "cerebras",
-      }))
+      data: [
+        {
+          id: EXTERNAL_MODEL_ID,
+          object: "model",
+          created: now,
+          owned_by: "cerebras",
+        }
+      ]
     };
 
     return new Response(JSON.stringify(response), {
@@ -991,6 +1001,31 @@ async function handler(req: Request): Promise<Response> {
             display: flex;
             gap: 10px;
           }
+          .models-list {
+            margin-top: 20px;
+          }
+          .model-item {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+          }
+          .model-info {
+            flex: 1;
+          }
+          .model-name {
+            font-family: monospace;
+            color: #333;
+            margin-bottom: 5px;
+          }
+          .model-actions {
+            display: flex;
+            gap: 10px;
+          }
           .notification {
             position: fixed;
             top: 20px;
@@ -1095,7 +1130,7 @@ async function handler(req: Request): Promise<Response> {
                   <input type="text" id="newModel" class="form-control" placeholder="输入模型名称（如 gpt-oss-120b）">
                   <button class="btn" onclick="addModel()" style="margin-top: 10px;">添加模型</button>
                 </div>
-                <div class="keys-list" id="modelsList" style="margin-top: 15px;">
+                <div class="models-list" id="modelsList" style="margin-top: 15px;">
                   <h4 style="margin-bottom: 10px;">当前模型池</h4>
                   <div id="modelsContainer"></div>
                 </div>
@@ -1234,12 +1269,12 @@ async function handler(req: Request): Promise<Response> {
               if (data.models && data.models.length > 0) {
                 data.models.forEach(model => {
                   const item = document.createElement('div');
-                  item.className = 'key-item';
+                  item.className = 'model-item';
                   item.innerHTML = \`
-                    <div class="key-info">
-                      <div class="key-masked">\${model}</div>
+                    <div class="model-info">
+                      <div class="model-name">\${model}</div>
                     </div>
-                    <div class="key-actions">
+                    <div class="model-actions">
                       <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(model)}')">测试</button>
                       <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(model)}')">删除</button>
                     </div>

@@ -88,7 +88,7 @@ Cerebras 官方本身提供了 OpenAI 兼容风格的 API（如 `/v1/chat/comple
    * **上游地址**：`https://<你的 Deno 项目名>.deno.dev/v1/chat/completions`。
    * **模型**：任意填写，系统会自动映射到面板中配置的默认模型。
 
-> 详细部署步骤与运维说明请查看 [KV 持久化部署指南](KV_DEPLOYMENT_GUIDE.md)。
+> 详细部署步骤与运维说明请查看 [KV 持久化部署指南](KV_DEPLOYMENT_GUIDE.md)。实现细节与成本说明请查看 [技术细节](TECH_DETAILS.md)。
 
 ### 📸 配置截图
 

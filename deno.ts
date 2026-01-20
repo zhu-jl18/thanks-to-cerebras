@@ -1,0 +1,1758 @@
+// deno.ts - Cerebras API 代理与密钥管理系统
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+
+// ================================
+// 配置常量
+// ================================
+const CEREBRAS_API_URL = 'https://api.cerebras.ai/v1/chat/completions';
+const KV_PREFIX = "cerebras-proxy";
+const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
+const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
+const PROXY_KEY_PREFIX = [KV_PREFIX, "keys", "proxy"] as const;
+const ADMIN_PASSWORD_KEY = [KV_PREFIX, "meta", "admin_password"] as const;
+const ADMIN_TOKEN_PREFIX = [KV_PREFIX, "auth", "token"] as const;
+const KV_ATOMIC_MAX_RETRIES = 10;
+const MAX_PROXY_KEYS = 5;
+const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
+const KV_FLUSH_INTERVAL_MS = (() => {
+  const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
+  if (!raw) return DEFAULT_KV_FLUSH_INTERVAL_MS;
+  const ms = Number.parseInt(raw, 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_KV_FLUSH_INTERVAL_MS;
+})();
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, DELETE, PUT',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+const NO_CACHE_HEADERS = {
+  "Cache-Control": "no-store, max-age=0",
+  "Pragma": "no-cache",
+  "Expires": "0",
+};
+
+// ================================
+// Deno KV 存储
+// ================================
+const isDenoDeployment = Boolean(Deno.env.get("DENO_DEPLOYMENT_ID"));
+const kv = await (async () => {
+  if (isDenoDeployment) return Deno.openKv();
+  const kvDir = `${import.meta.dirname}/.deno-kv-local`;
+  try { Deno.mkdirSync(kvDir, { recursive: true }); } catch { /* exists */ }
+  return Deno.openKv(`${kvDir}/kv.sqlite3`);
+})();
+
+// ================================
+// 类型定义
+// ================================
+interface ApiKey {
+  id: string;
+  key: string;
+  useCount: number;
+  lastUsed?: number;
+  status: 'active' | 'inactive' | 'invalid';
+  createdAt: number;
+}
+
+interface ProxyAuthKey {
+  id: string;
+  key: string;
+  name: string;
+  useCount: number;
+  lastUsed?: number;
+  createdAt: number;
+}
+
+interface ProxyConfig {
+  modelPool: string[];
+  currentModelIndex: number;
+  currentKeyIndex: number;
+  totalRequests: number;
+  schemaVersion: string;
+}
+
+const DEFAULT_MODEL_POOL = [
+  'gpt-oss-120b',
+  'qwen-3-235b-a22b-instruct-2507',
+  'zai-glm-4.6',
+  'zai-glm-4.7',
+];
+const FALLBACK_MODEL = 'qwen-3-235b-a22b-instruct-2507';
+const EXTERNAL_MODEL_ID = 'cerebras-translator';
+
+// ================================
+// 运行时缓存
+// ================================
+let cachedConfig: ProxyConfig | null = null;
+let cachedKeysById = new Map<string, ApiKey>();
+let cachedActiveKeyIds: string[] = [];
+let cachedCursor = 0;
+const keyCooldownUntil = new Map<string, number>();
+const dirtyKeyIds = new Set<string>();
+let dirtyConfig = false;
+let flushInProgress = false;
+
+let cachedModelPool: string[] = [];
+let modelCursor = 0;
+
+// 代理鉴权密钥缓存
+let cachedProxyKeys = new Map<string, ProxyAuthKey>();
+const dirtyProxyKeyIds = new Set<string>();
+
+// ================================
+// 工具函数
+// ================================
+function generateId(): string {
+  return crypto.randomUUID();
+}
+
+function generateProxyKey(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = 'cpk_';
+  for (let i = 0; i < 32; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 8) return "*".repeat(key.length);
+  return key.substring(0, 4) + "*".repeat(key.length - 8) + key.substring(key.length - 4);
+}
+
+function parseBatchInput(input: string): string[] {
+  return input
+    .split(/[\n,\s]+/)
+    .map(k => k.trim())
+    .filter(k => k.length > 0);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// 代理 API 鉴权：无密钥则公开，有密钥则验证
+async function isProxyAuthorized(req: Request): Promise<{ authorized: boolean; keyId?: string }> {
+  if (cachedProxyKeys.size === 0) {
+    return { authorized: true };
+  }
+
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return { authorized: false };
+  }
+
+  const token = authHeader.substring(7).trim();
+  for (const [id, pk] of cachedProxyKeys) {
+    if (pk.key === token) {
+      return { authorized: true, keyId: id };
+    }
+  }
+
+  return { authorized: false };
+}
+
+function recordProxyKeyUsage(keyId: string): void {
+  const pk = cachedProxyKeys.get(keyId);
+  if (!pk) return;
+  pk.useCount++;
+  pk.lastUsed = Date.now();
+  dirtyProxyKeyIds.add(keyId);
+}
+
+// 管理面板鉴权
+async function hashPassword(password: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function getAdminPassword(): Promise<string | null> {
+  const entry = await kv.get<string>(ADMIN_PASSWORD_KEY);
+  return entry.value;
+}
+
+async function setAdminPassword(password: string): Promise<void> {
+  const hash = await hashPassword(password);
+  await kv.set(ADMIN_PASSWORD_KEY, hash);
+}
+
+async function verifyAdminPassword(password: string): Promise<boolean> {
+  const storedHash = await getAdminPassword();
+  if (!storedHash) return false;
+  const inputHash = await hashPassword(password);
+  return storedHash === inputHash;
+}
+
+async function createAdminToken(): Promise<string> {
+  const token = crypto.randomUUID();
+  const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  await kv.set([...ADMIN_TOKEN_PREFIX, token], expiry);
+  return token;
+}
+
+async function verifyAdminToken(token: string | null): Promise<boolean> {
+  if (!token) return false;
+  const entry = await kv.get<number>([...ADMIN_TOKEN_PREFIX, token]);
+  if (!entry.value) return false;
+  if (Date.now() > entry.value) {
+    await kv.delete([...ADMIN_TOKEN_PREFIX, token]);
+    return false;
+  }
+  return true;
+}
+
+async function isAdminAuthorized(req: Request): Promise<boolean> {
+  const token = req.headers.get("X-Admin-Token");
+  return await verifyAdminToken(token);
+}
+
+function rebuildActiveKeyIds(): void {
+  const keys = Array.from(cachedKeysById.values());
+  keys.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+  cachedActiveKeyIds = keys.filter(k => k.status === 'active').map(k => k.id);
+  if (cachedActiveKeyIds.length === 0) {
+    cachedCursor = 0;
+    return;
+  }
+  cachedCursor = cachedCursor % cachedActiveKeyIds.length;
+}
+
+function getNextApiKeyFast(now: number): { key: string; id: string } | null {
+  if (cachedActiveKeyIds.length === 0) return null;
+
+  for (let offset = 0; offset < cachedActiveKeyIds.length; offset++) {
+    const idx = (cachedCursor + offset) % cachedActiveKeyIds.length;
+    const id = cachedActiveKeyIds[idx];
+    const cooldownUntil = keyCooldownUntil.get(id) ?? 0;
+    if (cooldownUntil > now) continue;
+
+    const keyEntry = cachedKeysById.get(id);
+    if (!keyEntry || keyEntry.status !== 'active') continue;
+
+    cachedCursor = (idx + 1) % cachedActiveKeyIds.length;
+
+    keyEntry.useCount += 1;
+    keyEntry.lastUsed = now;
+    dirtyKeyIds.add(id);
+
+    if (cachedConfig) {
+      cachedConfig.totalRequests += 1;
+      dirtyConfig = true;
+    }
+
+    return { key: keyEntry.key, id };
+  }
+
+  return null;
+}
+
+function markKeyCooldownFrom429(id: string, response: Response): void {
+  const retryAfter = response.headers.get("retry-after")?.trim();
+  const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter) ? Number.parseInt(retryAfter, 10) * 1000 : 2000;
+  keyCooldownUntil.set(id, Date.now() + Math.max(0, retryAfterMs));
+}
+
+function markKeyInvalid(id: string): void {
+  const keyEntry = cachedKeysById.get(id);
+  if (!keyEntry) return;
+  if (keyEntry.status === 'invalid') return;
+  keyEntry.status = 'invalid';
+  dirtyKeyIds.add(id);
+  keyCooldownUntil.delete(id);
+  rebuildActiveKeyIds();
+}
+
+function getNextModelFast(): string {
+  if (cachedModelPool.length === 0) {
+    return FALLBACK_MODEL;
+  }
+  const idx = modelCursor % cachedModelPool.length;
+  const model = cachedModelPool[idx];
+  modelCursor = (idx + 1) % cachedModelPool.length;
+
+  if (cachedConfig) {
+    cachedConfig.currentModelIndex = modelCursor;
+    dirtyConfig = true;
+  }
+
+  return model;
+}
+
+function rebuildModelPoolCache(): void {
+  if (cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0) {
+    cachedModelPool = [...cachedConfig.modelPool];
+    modelCursor = (cachedConfig.currentModelIndex ?? 0) % cachedModelPool.length;
+  } else {
+    cachedModelPool = [...DEFAULT_MODEL_POOL];
+    modelCursor = 0;
+  }
+}
+
+async function flushDirtyToKv(): Promise<void> {
+  if (flushInProgress) return;
+  if (!dirtyConfig && dirtyKeyIds.size === 0 && dirtyProxyKeyIds.size === 0) return;
+  if (!cachedConfig) return;
+
+  flushInProgress = true;
+  const keyIds = Array.from(dirtyKeyIds);
+  dirtyKeyIds.clear();
+  const proxyKeyIds = Array.from(dirtyProxyKeyIds);
+  dirtyProxyKeyIds.clear();
+  const flushConfig = dirtyConfig;
+  dirtyConfig = false;
+
+  try {
+    const tasks: Promise<unknown>[] = [];
+    for (const id of keyIds) {
+      const keyEntry = cachedKeysById.get(id);
+      if (!keyEntry) continue;
+      tasks.push(kv.set([...API_KEY_PREFIX, id], keyEntry));
+    }
+    for (const id of proxyKeyIds) {
+      const pk = cachedProxyKeys.get(id);
+      if (!pk) continue;
+      tasks.push(kv.set([...PROXY_KEY_PREFIX, id], pk));
+    }
+    if (flushConfig) {
+      tasks.push(kv.set(CONFIG_KEY, cachedConfig));
+    }
+    await Promise.all(tasks);
+  } catch (error) {
+    for (const id of keyIds) dirtyKeyIds.add(id);
+    for (const id of proxyKeyIds) dirtyProxyKeyIds.add(id);
+    dirtyConfig = dirtyConfig || flushConfig;
+    console.error(`[KV] flush failed:`, error);
+  } finally {
+    flushInProgress = false;
+  }
+}
+
+async function bootstrapCache(): Promise<void> {
+  cachedConfig = await kvGetConfig();
+  const keys = await kvGetAllKeys();
+  cachedKeysById = new Map(keys.map(k => [k.id, k]));
+  rebuildActiveKeyIds();
+  rebuildModelPoolCache();
+
+  const proxyKeys = await kvGetAllProxyKeys();
+  cachedProxyKeys = new Map(proxyKeys.map(k => [k.id, k]));
+}
+
+// ================================
+// KV 存储操作
+// ================================
+async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
+  let entry = await kv.get<ProxyConfig>(CONFIG_KEY);
+
+  if (!entry.value) {
+    const defaultConfig: ProxyConfig = {
+      modelPool: [...DEFAULT_MODEL_POOL],
+      currentModelIndex: 0,
+      currentKeyIndex: 0,
+      totalRequests: 0,
+      schemaVersion: '3.0'
+    };
+    await kv.set(CONFIG_KEY, defaultConfig);
+    entry = await kv.get<ProxyConfig>(CONFIG_KEY);
+  }
+
+  if (!entry.value) {
+    throw new Error("KV 配置初始化失败");
+  }
+  return entry;
+}
+
+async function kvGetConfig(): Promise<ProxyConfig> {
+  const entry = await kvEnsureConfigEntry();
+  return entry.value;
+}
+
+async function kvUpdateConfig(updater: (config: ProxyConfig) => ProxyConfig | Promise<ProxyConfig>): Promise<ProxyConfig> {
+  for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
+    const entry = await kvEnsureConfigEntry();
+    const nextConfig = await updater(entry.value);
+    const result = await kv.atomic().check(entry).set(CONFIG_KEY, nextConfig).commit();
+    if (result.ok) {
+      cachedConfig = nextConfig;
+      return nextConfig;
+    }
+  }
+  throw new Error("配置更新失败：达到最大重试次数");
+}
+
+async function kvGetAllKeys(): Promise<ApiKey[]> {
+  const keys: ApiKey[] = [];
+  const iter = kv.list({ prefix: API_KEY_PREFIX });
+  for await (const entry of iter) {
+    keys.push(entry.value as ApiKey);
+  }
+  return keys;
+}
+
+async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; error?: string }> {
+  const allKeys = Array.from(cachedKeysById.values());
+  const existingKey = allKeys.find(k => k.key === key);
+  if (existingKey) {
+    return { success: false, error: "密钥已存在" };
+  }
+
+  const id = generateId();
+  const newKey: ApiKey = {
+    id,
+    key,
+    useCount: 0,
+    status: 'active',
+    createdAt: Date.now(),
+  };
+
+  await kv.set([...API_KEY_PREFIX, id], newKey);
+  cachedKeysById.set(id, newKey);
+  rebuildActiveKeyIds();
+
+  return { success: true, id };
+}
+
+async function kvDeleteKey(id: string): Promise<{ success: boolean; error?: string }> {
+  const key = [...API_KEY_PREFIX, id];
+  const result = await kv.get(key);
+  if (!result.value) {
+    return { success: false, error: "密钥不存在" };
+  }
+
+  await kv.delete(key);
+  cachedKeysById.delete(id);
+  keyCooldownUntil.delete(id);
+  dirtyKeyIds.delete(id);
+  rebuildActiveKeyIds();
+  return { success: true };
+}
+
+async function kvUpdateKey(id: string, updates: Partial<ApiKey>): Promise<void> {
+  const key = [...API_KEY_PREFIX, id];
+  const existing = cachedKeysById.get(id) ?? (await kv.get<ApiKey>(key)).value;
+  if (!existing) return;
+  const updated = { ...existing, ...updates };
+  cachedKeysById.set(id, updated);
+  rebuildActiveKeyIds();
+  await kv.set(key, updated);
+}
+
+// 代理鉴权密钥 KV 操作
+async function kvGetAllProxyKeys(): Promise<ProxyAuthKey[]> {
+  const keys: ProxyAuthKey[] = [];
+  const iter = kv.list({ prefix: PROXY_KEY_PREFIX });
+  for await (const entry of iter) {
+    keys.push(entry.value as ProxyAuthKey);
+  }
+  return keys;
+}
+
+async function kvAddProxyKey(name: string): Promise<{ success: boolean; id?: string; key?: string; error?: string }> {
+  if (cachedProxyKeys.size >= MAX_PROXY_KEYS) {
+    return { success: false, error: `最多只能创建 ${MAX_PROXY_KEYS} 个代理密钥` };
+  }
+
+  const id = generateId();
+  const key = generateProxyKey();
+  const newKey: ProxyAuthKey = {
+    id,
+    key,
+    name: name || `密钥 ${cachedProxyKeys.size + 1}`,
+    useCount: 0,
+    createdAt: Date.now(),
+  };
+
+  await kv.set([...PROXY_KEY_PREFIX, id], newKey);
+  cachedProxyKeys.set(id, newKey);
+
+  return { success: true, id, key };
+}
+
+async function kvDeleteProxyKey(id: string): Promise<{ success: boolean; error?: string }> {
+  const key = [...PROXY_KEY_PREFIX, id];
+  if (!cachedProxyKeys.has(id)) {
+    return { success: false, error: "密钥不存在" };
+  }
+
+  await kv.delete(key);
+  cachedProxyKeys.delete(id);
+  dirtyProxyKeyIds.delete(id);
+  return { success: true };
+}
+
+// ================================
+// API 密钥测试
+// ================================
+async function testKey(id: string): Promise<{ success: boolean; status: string; error?: string }> {
+  const apiKey = cachedKeysById.get(id);
+
+  if (!apiKey) {
+    return { success: false, status: 'invalid', error: "密钥不存在" };
+  }
+
+  const testModel = cachedModelPool.length > 0 ? cachedModelPool[0] : FALLBACK_MODEL;
+
+  try {
+    const response = await fetch(CEREBRAS_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey.key}`,
+      },
+      body: JSON.stringify({
+        model: testModel,
+        messages: [{ role: 'user', content: 'test' }],
+        max_tokens: 1,
+      }),
+    });
+
+    if (response.ok) {
+      await kvUpdateKey(id, { status: 'active' });
+      return { success: true, status: 'active' };
+    } else {
+      await kvUpdateKey(id, { status: 'inactive' });
+      return { success: false, status: 'inactive', error: `HTTP ${response.status}` };
+    }
+  } catch (error) {
+    await kvUpdateKey(id, { status: 'invalid' });
+    return { success: false, status: 'invalid', error: getErrorMessage(error) };
+  }
+}
+
+// ================================
+// HTTP 处理函数
+// ================================
+async function handler(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  // 鉴权 API（无需登录）
+  if (path.startsWith('/api/auth/')) {
+    if (req.method === 'GET' && path === '/api/auth/status') {
+      const hasPassword = await getAdminPassword() !== null;
+      const token = req.headers.get("X-Admin-Token");
+      const isLoggedIn = await verifyAdminToken(token);
+      return new Response(JSON.stringify({ hasPassword, isLoggedIn }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path === '/api/auth/setup') {
+      const hasPassword = await getAdminPassword() !== null;
+      if (hasPassword) {
+        return new Response(JSON.stringify({ error: "密码已设置" }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+      try {
+        const { password } = await req.json();
+        if (!password || password.length < 4) {
+          return new Response(JSON.stringify({ error: "密码至少 4 位" }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+        await setAdminPassword(password);
+        const token = await createAdminToken();
+        return new Response(JSON.stringify({ success: true, token }), {
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'POST' && path === '/api/auth/login') {
+      try {
+        const { password } = await req.json();
+        const valid = await verifyAdminPassword(password);
+        if (!valid) {
+          return new Response(JSON.stringify({ error: "密码错误" }), {
+            status: 401,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+        const token = await createAdminToken();
+        return new Response(JSON.stringify({ success: true, token }), {
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'POST' && path === '/api/auth/logout') {
+      const token = req.headers.get("X-Admin-Token");
+      if (token) {
+        await kv.delete([...ADMIN_TOKEN_PREFIX, token]);
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "Not Found" }), {
+      status: 404,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  // 受保护的管理 API
+  if (path.startsWith('/api/')) {
+    if (!await isAdminAuthorized(req)) {
+      return new Response(JSON.stringify({ error: "未登录" }), {
+        status: 401,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ========== 代理鉴权密钥管理 ==========
+    if (req.method === 'GET' && path === '/api/proxy-keys') {
+      const keys = Array.from(cachedProxyKeys.values());
+      const masked = keys.map(k => ({
+        id: k.id,
+        key: maskKey(k.key),
+        name: k.name,
+        useCount: k.useCount,
+        lastUsed: k.lastUsed,
+        createdAt: k.createdAt,
+      }));
+      return new Response(JSON.stringify({
+        keys: masked,
+        maxKeys: MAX_PROXY_KEYS,
+        authEnabled: cachedProxyKeys.size > 0
+      }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path === '/api/proxy-keys') {
+      try {
+        const { name } = await req.json().catch(() => ({ name: '' }));
+        const result = await kvAddProxyKey(name);
+        return new Response(JSON.stringify(result), {
+          status: result.success ? 201 : 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'DELETE' && path.startsWith('/api/proxy-keys/')) {
+      const id = path.split('/').pop()!;
+      const result = await kvDeleteProxyKey(id);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'GET' && path.startsWith('/api/proxy-keys/') && path.endsWith('/export')) {
+      const id = path.split('/')[3];
+      const pk = cachedProxyKeys.get(id);
+      if (!pk) {
+        return new Response(JSON.stringify({ error: "密钥不存在" }), {
+          status: 404,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ key: pk.key }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ========== Cerebras API 密钥管理 ==========
+    if (req.method === 'GET' && path === '/api/keys') {
+      const keys = await kvGetAllKeys();
+      const maskedKeys = keys.map(k => ({
+        ...k,
+        key: maskKey(k.key),
+      }));
+      return new Response(JSON.stringify({ keys: maskedKeys }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path === '/api/keys') {
+      try {
+        const { key } = await req.json();
+        if (!key) {
+          return new Response(JSON.stringify({ error: "密钥不能为空" }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        const result = await kvAddKey(key);
+        return new Response(JSON.stringify(result), {
+          status: result.success ? 201 : 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'POST' && path === '/api/keys/batch') {
+      try {
+        const contentType = req.headers.get('Content-Type') || '';
+        let input: string;
+
+        if (contentType.includes('application/json')) {
+          const body = await req.json();
+          input = body.input || (typeof body === 'string' ? body : '');
+        } else {
+          input = await req.text();
+        }
+
+        if (!input?.trim()) {
+          return new Response(JSON.stringify({ error: "输入不能为空" }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        const keys = parseBatchInput(input);
+        const results = {
+          success: [] as string[],
+          failed: [] as { key: string; error: string }[],
+        };
+
+        for (const key of keys) {
+          const result = await kvAddKey(key);
+          if (result.success) {
+            results.success.push(maskKey(key));
+          } else {
+            results.failed.push({ key: maskKey(key), error: result.error || "未知错误" });
+          }
+        }
+
+        return new Response(JSON.stringify({
+          summary: {
+            total: keys.length,
+            success: results.success.length,
+            failed: results.failed.length,
+          },
+          results,
+        }), {
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'GET' && path === '/api/keys/export') {
+      const keys = Array.from(cachedKeysById.values());
+      const rawKeys = keys.map(k => k.key);
+      return new Response(JSON.stringify({ keys: rawKeys }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'GET' && path.startsWith('/api/keys/') && path.endsWith('/export')) {
+      const id = path.split('/')[3];
+      const keyEntry = cachedKeysById.get(id);
+      if (!keyEntry) {
+        return new Response(JSON.stringify({ error: "密钥不存在" }), {
+          status: 404,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ key: keyEntry.key }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'DELETE' && path.startsWith('/api/keys/')) {
+      const id = path.split('/').pop()!;
+      const result = await kvDeleteKey(id);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 400,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path.startsWith('/api/keys/') && path.endsWith('/test')) {
+      const id = path.split('/')[3];
+      const result = await testKey(id);
+      return new Response(JSON.stringify(result), {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ========== 统计和配置 ==========
+    if (req.method === 'GET' && path === '/api/stats') {
+      const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
+      const stats = {
+        totalKeys: keys.length,
+        activeKeys: keys.filter(k => k.status === 'active').length,
+        totalRequests: config.totalRequests,
+        keyUsage: keys.map(k => ({
+          id: k.id,
+          maskedKey: maskKey(k.key),
+          useCount: k.useCount,
+          status: k.status,
+        })),
+      };
+      return new Response(JSON.stringify(stats), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'GET' && path === '/api/config') {
+      const config = await kvGetConfig();
+      return new Response(JSON.stringify(config), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ========== 模型池管理 ==========
+    if (req.method === 'GET' && path === '/api/models') {
+      const config = await kvGetConfig();
+      const models = config.modelPool?.length > 0 ? config.modelPool : DEFAULT_MODEL_POOL;
+      return new Response(JSON.stringify({ models }), {
+        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path === '/api/models') {
+      try {
+        const { model } = await req.json();
+        if (!model?.trim()) {
+          return new Response(JSON.stringify({ error: "模型名称不能为空" }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        const trimmedModel = model.trim();
+        if (cachedModelPool.includes(trimmedModel)) {
+          return new Response(JSON.stringify({ error: "模型已存在" }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        await kvUpdateConfig(config => ({
+          ...config,
+          modelPool: [...config.modelPool, trimmedModel]
+        }));
+        rebuildModelPoolCache();
+
+        return new Response(JSON.stringify({ success: true, model: trimmedModel }), {
+          status: 201,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (req.method === 'DELETE' && path.startsWith('/api/models/')) {
+      const encodedName = path.substring('/api/models/'.length);
+      const modelName = decodeURIComponent(encodedName);
+
+      if (!cachedModelPool.includes(modelName)) {
+        return new Response(JSON.stringify({ error: "模型不存在" }), {
+          status: 404,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+
+      await kvUpdateConfig(config => ({
+        ...config,
+        modelPool: config.modelPool.filter(m => m !== modelName),
+        currentModelIndex: 0
+      }));
+      rebuildModelPoolCache();
+
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (req.method === 'POST' && path.startsWith('/api/models/') && path.endsWith('/test')) {
+      const parts = path.split('/');
+      const encodedName = parts[3];
+      const modelName = decodeURIComponent(encodedName);
+
+      const activeKey = Array.from(cachedKeysById.values()).find(k => k.status === 'active');
+      if (!activeKey) {
+        return new Response(JSON.stringify({ success: false, error: "没有可用的 API 密钥" }), {
+          status: 400,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+
+      try {
+        const response = await fetch(CEREBRAS_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeKey.key}`,
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: [{ role: 'user', content: 'test' }],
+            max_tokens: 1,
+          }),
+        });
+
+        if (response.ok) {
+          return new Response(JSON.stringify({ success: true, status: 'available' }), {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        } else {
+          return new Response(JSON.stringify({ success: false, status: 'unavailable', error: `HTTP ${response.status}` }), {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+      } catch (error) {
+        return new Response(JSON.stringify({ success: false, status: 'error', error: getErrorMessage(error) }), {
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ error: "Not Found" }), {
+      status: 404,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  // GET /v1/models - OpenAI 兼容
+  if (req.method === 'GET' && path === '/v1/models') {
+    const now = Math.floor(Date.now() / 1000);
+    return new Response(JSON.stringify({
+      object: "list",
+      data: [{
+        id: EXTERNAL_MODEL_ID,
+        object: "model",
+        created: now,
+        owned_by: "cerebras",
+      }]
+    }), {
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+    });
+  }
+
+  // POST /v1/chat/completions - 代理转发
+  if (req.method === 'POST' && path === '/v1/chat/completions') {
+    const authResult = await isProxyAuthorized(req);
+    if (!authResult.authorized) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    if (authResult.keyId) {
+      recordProxyKeyUsage(authResult.keyId);
+    }
+
+    try {
+      const requestBody = await req.json();
+      const targetModel = getNextModelFast();
+      requestBody.model = targetModel;
+
+      const apiKeyData = getNextApiKeyFast(Date.now());
+      if (!apiKeyData) {
+        const now = Date.now();
+        const cooldowns = cachedActiveKeyIds.map(id => keyCooldownUntil.get(id) ?? 0).filter(ms => ms > now);
+        const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
+        const retryAfterSeconds = minCooldownUntil > now ? Math.ceil((minCooldownUntil - now) / 1000) : 0;
+
+        return new Response(JSON.stringify({ error: "没有可用的 API 密钥" }), {
+          status: cachedActiveKeyIds.length > 0 ? 429 : 500,
+          headers: {
+            ...CORS_HEADERS,
+            "Content-Type": "application/json",
+            ...(retryAfterSeconds > 0 ? { "Retry-After": String(retryAfterSeconds) } : {}),
+          },
+        });
+      }
+
+      const apiResponse = await fetch(CEREBRAS_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKeyData.key}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (apiResponse.status === 429) {
+        markKeyCooldownFrom429(apiKeyData.id, apiResponse);
+      }
+      if (apiResponse.status === 401 || apiResponse.status === 403) {
+        markKeyInvalid(apiKeyData.id);
+      }
+
+      const responseHeaders = new Headers(apiResponse.headers);
+      Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+        responseHeaders.set(key, value);
+      });
+
+      return new Response(apiResponse.body, {
+        status: apiResponse.status,
+        statusText: apiResponse.statusText,
+        headers: responseHeaders,
+      });
+
+    } catch (error) {
+      return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
+        status: 400,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+  }
+
+  // 主页
+  if (path === '/' && req.method === 'GET') {
+    const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
+    const proxyKeyCount = cachedProxyKeys.size;
+    const stats = {
+      totalKeys: keys.length,
+      activeKeys: keys.filter(k => k.status === 'active').length,
+      totalRequests: config.totalRequests,
+      proxyAuthEnabled: proxyKeyCount > 0,
+      proxyKeyCount,
+    };
+
+    const faviconDataUri = `data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzA2YjZkNCIgZD0iTTIyIDRoLTkuNzdMMTEgLjM0YS41LjUgMCAwIDAtLjUtLjM0SDJhMiAyIDAgMCAwLTIgMnYxNmEyIDIgMCAwIDAgMiAyaDkuNjVMMTMgMjMuNjhhLjUuNSAwIDAgMCAuNDcuMzJIMjJhMiAyIDAgMCAwIDItMlY2YTIgMiAwIDAgMC0yLTJaTTcuNSAxNWE0LjUgNC41IDAgMSAxIDIuOTItNy45Mi41LjUgMCAxIDEtLjY1Ljc2QTMuNSAzLjUgMCAxIDAgMTEgMTFINy41YS41LjUgMCAwIDEgMC0xaDRhLjUuNSAwIDAgMSAuNS41QTQuNSA0LjUgMCAwIDEgNy41IDE1Wm0xMS45LTRhMTEuMjYgMTEuMjYgMCAwIDEtMS44NiAzLjI5IDYuNjcgNi42NyAwIDAgMS0xLjA3LTEuNDguNS41IDAgMCAwLS45My4zOCA4IDggMCAwIDAgMS4zNCAxLjg3IDguOSA4LjkgMCAwIDEtLjY1LjYyTDE0LjYyIDExWk0yMyAyMmExIDEgMCAwIDEtMSAxaC03LjRsMi43Ny0zLjE3YS40OS40OSAwIDAgMCAuMDktLjQ4bC0uOTEtMi42NmE5LjM2IDkuMzYgMCAwIDAgMS0uODljMSAxIDEuOTMgMS45MSAyLjEyIDIuMDhhLjUuNSAwIDAgMCAuNjgtLjc0IDQzLjQ4IDQzLjQ4IDAgMCAxLTIuMTMtMi4xIDExLjQ5IDExLjQ5IDAgMCAwIDIuMjItNGgxLjA2YS41LjUgMCAwIDAgMC0xSDE4VjkuNWEuNS41IDAgMCAwLTEgMHYuNWgtMi41YS40OS40OSAwIDAgMC0uMjEgMGwtMS43Mi01SDIyYTEgMSAwIDAgMSAxIDFaIi8+PC9zdmc+`;
+
+    return new Response(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cerebras Translator</title>
+  <link rel="icon" type="image/svg+xml" href="${faviconDataUri}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* ========== 亮色主题（默认） ========== */
+    body, body.light {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%);
+      min-height: 100vh;
+      padding: 40px 20px;
+      color: #1e293b;
+      transition: background 0.3s, color 0.3s;
+    }
+    body .container, body.light .container { max-width: 600px; margin: 0 auto; }
+    body .header, body.light .header { text-align: center; margin-bottom: 24px; position: relative; }
+    body .logo, body.light .logo { width: 48px; height: 48px; margin: 0 auto 12px; filter: drop-shadow(0 0 16px rgba(6, 182, 212, 0.5)); }
+    body h1, body.light h1 { font-size: 22px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+    body h1 span, body.light h1 span { background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body .subtitle, body.light .subtitle { font-size: 13px; color: #64748b; }
+    body .card, body.light .card {
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(6, 182, 212, 0.15);
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+      overflow: hidden;
+    }
+    body .tabs, body.light .tabs { display: flex; border-bottom: 1px solid rgba(6, 182, 212, 0.15); background: rgba(248, 250, 252, 0.8); }
+    body .tab, body.light .tab {
+      flex: 1; padding: 12px 16px; text-align: center; font-size: 13px; font-weight: 500;
+      color: #64748b; cursor: pointer; border: none; background: transparent;
+      border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all 0.2s;
+    }
+    body .tab:hover, body.light .tab:hover { color: #475569; }
+    body .tab.active, body.light .tab.active { color: #06b6d4; border-bottom-color: #06b6d4; background: rgba(6, 182, 212, 0.05); }
+    body .tab-content, body.light .tab-content { display: none; padding: 20px; }
+    body .tab-content.active, body.light .tab-content.active { display: block; }
+    body .stats-row, body.light .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid rgba(6, 182, 212, 0.1); }
+    body .stat-item, body.light .stat-item { text-align: center; padding: 10px; background: rgba(6, 182, 212, 0.06); border-radius: 8px; border: 1px solid rgba(6, 182, 212, 0.12); }
+    body .stat-value, body.light .stat-value { font-size: 22px; font-weight: 600; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body .stat-label, body.light .stat-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+    body .form-group, body.light .form-group { margin-bottom: 14px; }
+    body .form-group label, body.light .form-group label { display: block; margin-bottom: 4px; color: #475569; font-size: 12px; font-weight: 500; }
+    body .form-control, body.light .form-control {
+      width: 100%; padding: 10px 12px; background: rgba(248, 250, 252, 0.9); border: 1px solid rgba(6, 182, 212, 0.2);
+      border-radius: 8px; font-size: 13px; color: #1e293b; font-family: 'Inter', sans-serif; transition: all 0.2s;
+    }
+    body .form-control::placeholder, body.light .form-control::placeholder { color: #94a3b8; }
+    body .form-control:focus, body.light .form-control:focus { outline: none; border-color: #06b6d4; box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.15); }
+    textarea.form-control { resize: vertical; min-height: 70px; }
+    .btn {
+      background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); color: #fff; border: none;
+      padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500;
+      transition: all 0.2s; font-family: 'Inter', sans-serif; box-shadow: 0 2px 8px rgba(6, 182, 212, 0.3);
+    }
+    .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(6, 182, 212, 0.4); }
+    body .btn-outline, body.light .btn-outline { background: transparent; color: #0891b2; border: 1px solid rgba(6, 182, 212, 0.4); box-shadow: none; }
+    body .btn-outline:hover, body.light .btn-outline:hover { background: rgba(6, 182, 212, 0.08); transform: none; }
+    body .btn-danger, body.light .btn-danger { background: transparent; color: #dc2626; border: 1px solid rgba(220, 38, 38, 0.4); box-shadow: none; }
+    body .btn-danger:hover, body.light .btn-danger:hover { background: rgba(220, 38, 38, 0.08); transform: none; }
+    body .btn-success, body.light .btn-success { background: transparent; color: #16a34a; border: 1px solid rgba(22, 163, 74, 0.4); box-shadow: none; }
+    body .btn-success:hover, body.light .btn-success:hover { background: rgba(22, 163, 74, 0.08); transform: none; }
+    body .divider, body.light .divider { height: 1px; background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.15), transparent); margin: 16px 0; }
+    body .list-item, body.light .list-item {
+      background: rgba(248, 250, 252, 0.8); border: 1px solid rgba(6, 182, 212, 0.1); border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; transition: all 0.2s;
+    }
+    body .list-item:hover, body.light .list-item:hover { border-color: rgba(6, 182, 212, 0.2); background: rgba(255, 255, 255, 0.9); }
+    .item-info { flex: 1; min-width: 0; }
+    body .item-primary, body.light .item-primary { display: flex; align-items: center; gap: 6px; color: #334155; font-size: 11px; margin-bottom: 2px; flex-wrap: wrap; }
+    .key-text { font-family: 'JetBrains Mono', monospace; word-break: break-all; }
+    .key-actions { display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; }
+    body .item-secondary, body.light .item-secondary { font-size: 10px; color: #64748b; display: flex; align-items: center; gap: 4px; }
+    .status-badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 500; text-transform: uppercase; }
+    body .status-active, body.light .status-active { background: rgba(22, 163, 74, 0.12); color: #16a34a; }
+    body .status-inactive, body.light .status-inactive { background: rgba(202, 138, 4, 0.12); color: #ca8a04; }
+    body .status-invalid, body.light .status-invalid { background: rgba(220, 38, 38, 0.12); color: #dc2626; }
+    .item-actions { display: flex; gap: 4px; flex-shrink: 0; margin-left: 10px; }
+    .item-actions .btn { padding: 5px 8px; font-size: 10px; }
+    body .btn-icon, body.light .btn-icon { background: none; border: none; padding: 4px; cursor: pointer; color: #64748b; transition: color 0.2s; display: inline-flex; align-items: center; justify-content: center; }
+    body .btn-icon:hover, body.light .btn-icon:hover { color: #06b6d4; }
+    body .notification, body.light .notification {
+      position: fixed; top: 16px; right: 16px; background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(8px);
+      border: 1px solid rgba(6, 182, 212, 0.2); border-radius: 8px; padding: 10px 16px; display: none; z-index: 1000;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); font-size: 12px;
+    }
+    .notification.show { display: block; animation: slideIn 0.3s ease; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    body .notification.success, body.light .notification.success { color: #16a34a; border-color: rgba(22, 163, 74, 0.3); }
+    body .notification.error, body.light .notification.error { color: #dc2626; border-color: rgba(220, 38, 38, 0.3); }
+    body .hint, body.light .hint { font-size: 11px; color: #64748b; margin-top: 10px; }
+    body .empty-state, body.light .empty-state { text-align: center; padding: 20px; color: #64748b; font-size: 12px; }
+    body .section-title, body.light .section-title { font-size: 12px; font-weight: 500; color: #475569; margin-bottom: 10px; }
+    .auth-badge { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 500; margin-left: 8px; }
+    body .auth-on, body.light .auth-on { background: rgba(22, 163, 74, 0.12); color: #16a34a; }
+    body .auth-off, body.light .auth-off { background: rgba(202, 138, 4, 0.12); color: #ca8a04; }
+    body .footer, body.light .footer { text-align: center; margin-top: 20px; font-size: 11px; color: #64748b; }
+    body .footer span, body.light .footer span { color: #06b6d4; }
+    body #authOverlay, body.light #authOverlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%);
+      display: flex; align-items: center; justify-content: center; z-index: 9999;
+    }
+    body .auth-card, body.light .auth-card {
+      background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px); border: 1px solid rgba(6, 182, 212, 0.15);
+      border-radius: 12px; padding: 32px; max-width: 340px; width: 90%; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+    }
+    body .auth-card h2, body.light .auth-card h2 { color: #1e293b; }
+
+    /* ========== 暗色主题 ========== */
+    body.dark {
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+      color: #e2e8f0;
+    }
+    body.dark h1 { color: #f1f5f9; }
+    body.dark .card {
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid rgba(6, 182, 212, 0.2);
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    }
+    body.dark .tabs { background: rgba(15, 23, 42, 0.5); }
+    body.dark .tab:hover { color: #94a3b8; }
+    body.dark .stat-item { background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.15); }
+    body.dark .form-group label { color: #94a3b8; }
+    body.dark .form-control {
+      background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(6, 182, 212, 0.25);
+      color: #e2e8f0;
+    }
+    body.dark .form-control::placeholder { color: #475569; }
+    body.dark .form-control:focus { box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.2); }
+    body.dark .btn-outline { color: #06b6d4; }
+    body.dark .btn-outline:hover { background: rgba(6, 182, 212, 0.1); }
+    body.dark .btn-danger { color: #f87171; border-color: rgba(248, 113, 113, 0.4); }
+    body.dark .btn-danger:hover { background: rgba(248, 113, 113, 0.1); }
+    body.dark .btn-success { color: #4ade80; border-color: rgba(74, 222, 128, 0.4); }
+    body.dark .btn-success:hover { background: rgba(74, 222, 128, 0.1); }
+    body.dark .divider { background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.2), transparent); }
+    body.dark .list-item {
+      background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(6, 182, 212, 0.1);
+    }
+    body.dark .list-item:hover { border-color: rgba(6, 182, 212, 0.25); background: rgba(15, 23, 42, 0.8); }
+    body.dark .item-primary { color: #cbd5e1; }
+    body.dark .status-active { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+    body.dark .status-inactive { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+    body.dark .status-invalid { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+    body.dark .notification {
+      background: rgba(30, 41, 59, 0.95);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    }
+    body.dark .notification.success { color: #4ade80; border-color: rgba(74, 222, 128, 0.4); }
+    body.dark .notification.error { color: #f87171; border-color: rgba(248, 113, 113, 0.4); }
+    body.dark .section-title { color: #94a3b8; }
+    body.dark .auth-on { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+    body.dark .auth-off { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+    body.dark .footer { color: #475569; }
+    body.dark #authOverlay {
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+    }
+    body.dark .auth-card {
+      background: rgba(30, 41, 59, 0.9); border: 1px solid rgba(6, 182, 212, 0.25);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+    body.dark .auth-card h2 { color: #f1f5f9; }
+
+    /* ========== 主题切换按钮 ========== */
+    .theme-toggle {
+      position: absolute; top: 0; right: 0;
+      background: none; border: none; cursor: pointer; padding: 8px;
+      color: #64748b; transition: color 0.2s;
+    }
+    .theme-toggle:hover { color: #06b6d4; }
+    .theme-toggle svg { width: 20px; height: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <button class="theme-toggle" onclick="toggleTheme()" title="切换主题">
+        <svg id="sunIcon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+        <svg id="moonIcon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none;">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+      <div class="logo">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+          <path fill="#06b6d4" d="M22 4h-9.77L11 .34a.5.5 0 0 0-.5-.34H2a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h9.65L13 23.68a.5.5 0 0 0 .47.32H22a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM7.5 15a4.5 4.5 0 1 1 2.92-7.92.5.5 0 1 1-.65.76A3.5 3.5 0 1 0 11 11H7.5a.5.5 0 0 1 0-1h4a.5.5 0 0 1 .5.5A4.5 4.5 0 0 1 7.5 15Zm11.9-4a11.26 11.26 0 0 1-1.86 3.29 6.67 6.67 0 0 1-1.07-1.48.5.5 0 0 0-.93.38 8 8 0 0 0 1.34 1.87 8.9 8.9 0 0 1-.65.62L14.62 11ZM23 22a1 1 0 0 1-1 1h-7.4l2.77-3.17a.49.49 0 0 0 .09-.48l-.91-2.66a9.36 9.36 0 0 0 1-.89c1 1 1.93 1.91 2.12 2.08a.5.5 0 0 0 .68-.74 43.48 43.48 0 0 1-2.13-2.1 11.49 11.49 0 0 0 2.22-4h1.06a.5.5 0 0 0 0-1H18V9.5a.5.5 0 0 0-1 0v.5h-2.5a.49.49 0 0 0-.21 0l-1.72-5H22a1 1 0 0 1 1 1Z"/>
+        </svg>
+      </div>
+      <h1><span>Cerebras</span> Translator</h1>
+      <p class="subtitle">基于大善人的翻译用中转服务</p>
+    </div>
+
+    <div class="card">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab('keys')">API 密钥</button>
+        <button class="tab" onclick="switchTab('models')">模型配置</button>
+        <button class="tab" onclick="switchTab('access')">访问控制</button>
+      </div>
+
+      <div id="keysTab" class="tab-content active">
+        <div class="stats-row">
+          <div class="stat-item">
+            <div class="stat-value">${stats.totalKeys}</div>
+            <div class="stat-label">总密钥</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value">${stats.activeKeys}</div>
+            <div class="stat-label">活跃</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-value">${stats.totalRequests}</div>
+            <div class="stat-label">请求数</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>添加 Cerebras API 密钥</label>
+          <input type="text" id="singleKey" class="form-control" placeholder="输入 Cerebras API 密钥">
+          <button class="btn" onclick="addSingleKey()" style="margin-top: 8px;">添加</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="form-group">
+          <label>批量导入</label>
+          <textarea id="batchKeys" class="form-control" placeholder="每行一个密钥"></textarea>
+          <button class="btn" onclick="addBatchKeys()" style="margin-top: 8px;">导入</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <span class="section-title" style="margin: 0;">密钥列表</span>
+          <button class="btn btn-outline" onclick="exportAllKeys()">导出全部</button>
+        </div>
+        <div id="keysContainer"></div>
+      </div>
+
+      <div id="modelsTab" class="tab-content">
+        <p class="hint" style="margin-top: 0; margin-bottom: 14px;">模型池轮询，分散 TPM 负载</p>
+
+        <div class="form-group">
+          <label>添加模型</label>
+          <input type="text" id="newModel" class="form-control" placeholder="例如 llama-3.3-70b">
+          <button class="btn" onclick="addModel()" style="margin-top: 8px;">添加</button>
+        </div>
+
+        <div class="divider"></div>
+        <div class="section-title">模型列表</div>
+        <div id="modelsContainer"></div>
+      </div>
+
+      <div id="accessTab" class="tab-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <div>
+            <span class="section-title" style="margin: 0;">代理访问密钥</span>
+            <span id="authBadge" class="auth-badge ${stats.proxyAuthEnabled ? 'auth-on' : 'auth-off'}">${stats.proxyAuthEnabled ? '鉴权已开启' : '公开访问'}</span>
+          </div>
+          <span style="font-size: 11px; color: #64748b;" id="keyCountLabel">${stats.proxyKeyCount}/${MAX_PROXY_KEYS}</span>
+        </div>
+        <p class="hint" style="margin-top: 0; margin-bottom: 14px;">创建密钥后自动开启鉴权；删除所有密钥则变为公开访问</p>
+
+        <div class="form-group">
+          <label>密钥名称（可选）</label>
+          <input type="text" id="proxyKeyName" class="form-control" placeholder="例如：移动端应用">
+          <button class="btn" onclick="createProxyKey()" style="margin-top: 8px;" id="createProxyKeyBtn">创建密钥</button>
+        </div>
+
+        <div class="divider"></div>
+        <div class="section-title">已创建的密钥</div>
+        <div id="proxyKeysContainer"></div>
+      </div>
+    </div>
+
+    <div class="footer">Endpoint: <span>/v1/chat/completions</span></div>
+    <div class="notification" id="notification"></div>
+  </div>
+
+  <div id="authOverlay">
+    <div class="auth-card">
+      <div style="text-align: center; margin-bottom: 20px;">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" style="width: 40px; height: 40px; margin-bottom: 8px; filter: drop-shadow(0 0 12px rgba(6, 182, 212, 0.5));">
+          <path fill="#06b6d4" d="M22 4h-9.77L11 .34a.5.5 0 0 0-.5-.34H2a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h9.65L13 23.68a.5.5 0 0 0 .47.32H22a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM7.5 15a4.5 4.5 0 1 1 2.92-7.92.5.5 0 1 1-.65.76A3.5 3.5 0 1 0 11 11H7.5a.5.5 0 0 1 0-1h4a.5.5 0 0 1 .5.5A4.5 4.5 0 0 1 7.5 15Zm11.9-4a11.26 11.26 0 0 1-1.86 3.29 6.67 6.67 0 0 1-1.07-1.48.5.5 0 0 0-.93.38 8 8 0 0 0 1.34 1.87 8.9 8.9 0 0 1-.65.62L14.62 11ZM23 22a1 1 0 0 1-1 1h-7.4l2.77-3.17a.49.49 0 0 0 .09-.48l-.91-2.66a9.36 9.36 0 0 0 1-.89c1 1 1.93 1.91 2.12 2.08a.5.5 0 0 0 .68-.74 43.48 43.48 0 0 1-2.13-2.1 11.49 11.49 0 0 0 2.22-4h1.06a.5.5 0 0 0 0-1H18V9.5a.5.5 0 0 0-1 0v.5h-2.5a.49.49 0 0 0-.21 0l-1.72-5H22a1 1 0 0 1 1 1Z"/>
+        </svg>
+        <h2 style="color: #f1f5f9; font-size: 18px;"><span style="background: linear-gradient(135deg, #06b6d4, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Cerebras</span> Translator</h2>
+      </div>
+      <p id="authTitle" style="color: #94a3b8; font-size: 12px; text-align: center; margin-bottom: 20px;">加载中...</p>
+      <div class="form-group">
+        <label id="passwordLabel">密码</label>
+        <input type="password" id="authPassword" class="form-control" placeholder="输入密码">
+      </div>
+      <div id="confirmGroup" class="form-group" style="display: none;">
+        <label>确认密码</label>
+        <input type="password" id="authConfirm" class="form-control" placeholder="再次输入密码">
+      </div>
+      <button class="btn" id="authBtn" onclick="handleAuth()" style="width: 100%; padding: 10px; font-size: 13px;">提交</button>
+      <p id="authError" style="color: #f87171; font-size: 11px; text-align: center; margin-top: 10px; display: none;"></p>
+    </div>
+  </div>
+
+  <script>
+    let adminToken = localStorage.getItem('adminToken') || '';
+    let authMode = 'login';
+    const MAX_PROXY_KEYS = ${MAX_PROXY_KEYS};
+
+    // 主题管理
+    function loadTheme() {
+      const saved = localStorage.getItem('theme') || 'light';
+      document.body.className = saved;
+      updateThemeIcon();
+    }
+
+    function toggleTheme() {
+      const current = document.body.classList.contains('dark') ? 'dark' : 'light';
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.body.className = next;
+      localStorage.setItem('theme', next);
+      updateThemeIcon();
+    }
+
+    function updateThemeIcon() {
+      const isDark = document.body.classList.contains('dark');
+      document.getElementById('sunIcon').style.display = isDark ? 'none' : 'block';
+      document.getElementById('moonIcon').style.display = isDark ? 'block' : 'none';
+    }
+
+    loadTheme();
+
+    function getAuthHeaders() { return { 'X-Admin-Token': adminToken }; }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      const tabs = ['keys', 'models', 'access'];
+      const idx = tabs.indexOf(tab);
+      if (idx >= 0) {
+        document.querySelectorAll('.tab')[idx].classList.add('active');
+        document.getElementById(tab + 'Tab').classList.add('active');
+      }
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/auth/status', { headers: getAuthHeaders() });
+        const data = await res.json();
+        if (!data.hasPassword) {
+          authMode = 'setup';
+          document.getElementById('authTitle').textContent = '首次使用，请设置管理密码';
+          document.getElementById('passwordLabel').textContent = '新密码（至少 4 位）';
+          document.getElementById('confirmGroup').style.display = 'block';
+          document.getElementById('authBtn').textContent = '设置密码';
+          document.getElementById('authOverlay').style.display = 'flex';
+        } else if (!data.isLoggedIn) {
+          authMode = 'login';
+          document.getElementById('authTitle').textContent = '请登录以继续';
+          document.getElementById('passwordLabel').textContent = '密码';
+          document.getElementById('confirmGroup').style.display = 'none';
+          document.getElementById('authBtn').textContent = '登录';
+          document.getElementById('authOverlay').style.display = 'flex';
+        } else {
+          document.getElementById('authOverlay').style.display = 'none';
+          loadProxyKeys();
+          loadKeys();
+          loadModels();
+        }
+      } catch (e) { showAuthError('检查登录状态失败'); }
+    }
+
+    function showAuthError(msg) {
+      const el = document.getElementById('authError');
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+
+    async function handleAuth() {
+      const password = document.getElementById('authPassword').value;
+      document.getElementById('authError').style.display = 'none';
+      if (authMode === 'setup') {
+        const confirm = document.getElementById('authConfirm').value;
+        if (password.length < 4) { showAuthError('密码至少 4 位'); return; }
+        if (password !== confirm) { showAuthError('两次密码不一致'); return; }
+        try {
+          const res = await fetch('/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+          const data = await res.json();
+          if (data.success && data.token) { adminToken = data.token; localStorage.setItem('adminToken', adminToken); checkAuth(); }
+          else showAuthError(data.error || '设置失败');
+        } catch (e) { showAuthError('错误: ' + e.message); }
+      } else {
+        try {
+          const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+          const data = await res.json();
+          if (data.success && data.token) { adminToken = data.token; localStorage.setItem('adminToken', adminToken); checkAuth(); }
+          else showAuthError(data.error || '登录失败');
+        } catch (e) { showAuthError('错误: ' + e.message); }
+      }
+    }
+
+    document.getElementById('authPassword').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') { if (authMode === 'setup') document.getElementById('authConfirm').focus(); else handleAuth(); }
+    });
+    document.getElementById('authConfirm')?.addEventListener('keypress', (e) => { if (e.key === 'Enter') handleAuth(); });
+
+    function showNotification(message, type = 'success') {
+      const notif = document.getElementById('notification');
+      notif.textContent = message;
+      notif.className = 'notification show ' + type;
+      setTimeout(() => notif.classList.remove('show'), 3000);
+    }
+
+    // 代理密钥管理
+    async function loadProxyKeys() {
+      try {
+        const res = await fetch('/api/proxy-keys', { headers: getAuthHeaders() });
+        const data = await res.json();
+        const container = document.getElementById('proxyKeysContainer');
+        const badge = document.getElementById('authBadge');
+        const countLabel = document.getElementById('keyCountLabel');
+        const createBtn = document.getElementById('createProxyKeyBtn');
+
+        countLabel.textContent = (data.keys?.length || 0) + '/' + MAX_PROXY_KEYS;
+        createBtn.disabled = (data.keys?.length || 0) >= MAX_PROXY_KEYS;
+
+        if (data.authEnabled) {
+          badge.className = 'auth-badge auth-on';
+          badge.textContent = '鉴权已开启';
+        } else {
+          badge.className = 'auth-badge auth-off';
+          badge.textContent = '公开访问';
+        }
+
+        if (data.keys?.length > 0) {
+          container.innerHTML = data.keys.map(k => \`
+            <div class="list-item">
+              <div class="item-info">
+                <div class="item-primary">
+                  <span class="key-text" id="pk-\${k.id}">\${k.key}</span>
+                  <button class="btn-icon" onclick="toggleProxyKeyVisibility('\${k.id}')" title="查看完整密钥">
+                    <svg id="pk-eye-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                    <svg id="pk-eye-off-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                  </button>
+                </div>
+                <div class="item-secondary">\${k.name} · 已使用 \${k.useCount} 次</div>
+              </div>
+              <div class="item-actions">
+                <button class="btn btn-outline" onclick="copyProxyKey('\${k.id}')">复制</button>
+                <button class="btn btn-danger" onclick="deleteProxyKey('\${k.id}')">删除</button>
+              </div>
+            </div>\`).join('');
+        } else {
+          container.innerHTML = '<div class="empty-state">暂无代理密钥，API 当前为公开访问</div>';
+        }
+      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+    }
+
+    async function createProxyKey() {
+      const name = document.getElementById('proxyKeyName').value.trim();
+      try {
+        const res = await fetch('/api/proxy-keys', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+        const data = await res.json();
+        if (data.success) {
+          showNotification('密钥已创建，请立即复制保存');
+          document.getElementById('proxyKeyName').value = '';
+          loadProxyKeys();
+        } else showNotification(data.error || '创建失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function deleteProxyKey(id) {
+      if (!confirm('删除此密钥？使用此密钥的客户端将无法访问')) return;
+      try {
+        const res = await fetch('/api/proxy-keys/' + id, { method: 'DELETE', headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.success) { showNotification('密钥已删除'); loadProxyKeys(); }
+        else showNotification(data.error || '删除失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    const proxyKeyFullValues = {};
+    async function toggleProxyKeyVisibility(id) {
+      const keySpan = document.getElementById('pk-' + id);
+      const eyeIcon = document.getElementById('pk-eye-' + id);
+      const eyeOffIcon = document.getElementById('pk-eye-off-' + id);
+      if (eyeIcon.style.display !== 'none') {
+        if (!proxyKeyFullValues[id]) {
+          try {
+            const res = await fetch('/api/proxy-keys/' + id + '/export', { headers: getAuthHeaders() });
+            const data = await res.json();
+            if (data.key) proxyKeyFullValues[id] = data.key;
+          } catch (e) { return; }
+        }
+        if (proxyKeyFullValues[id]) {
+          keySpan.textContent = proxyKeyFullValues[id];
+          eyeIcon.style.display = 'none';
+          eyeOffIcon.style.display = 'inline';
+        }
+      } else { loadProxyKeys(); }
+    }
+
+    async function copyProxyKey(id) {
+      try {
+        const res = await fetch('/api/proxy-keys/' + id + '/export', { headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.key) { await navigator.clipboard.writeText(data.key); showNotification('密钥已复制'); }
+        else showNotification(data.error || '复制失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    // API 密钥管理
+    async function addSingleKey() {
+      const key = document.getElementById('singleKey').value.trim();
+      if (!key) { showNotification('请输入密钥', 'error'); return; }
+      try {
+        const res = await fetch('/api/keys', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+        const data = await res.json();
+        if (data.success) { showNotification('密钥已添加'); document.getElementById('singleKey').value = ''; loadKeys(); }
+        else showNotification(data.error || '添加失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function addBatchKeys() {
+      const input = document.getElementById('batchKeys').value.trim();
+      if (!input) { showNotification('请输入密钥', 'error'); return; }
+      try {
+        const res = await fetch('/api/keys/batch', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ input }) });
+        const data = await res.json();
+        if (data.summary) { showNotification(\`导入完成：\${data.summary.success} 成功，\${data.summary.failed} 失败\`); document.getElementById('batchKeys').value = ''; loadKeys(); }
+        else showNotification(data.error || '导入失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function loadKeys() {
+      try {
+        const res = await fetch('/api/keys', { headers: getAuthHeaders() });
+        const data = await res.json();
+        const container = document.getElementById('keysContainer');
+        if (data.keys?.length > 0) {
+          container.innerHTML = data.keys.map(k => \`
+            <div class="list-item">
+              <div class="item-info">
+                <div class="item-primary">
+                  <span class="key-text" id="key-\${k.id}">\${k.key}</span>
+                  <span class="key-actions">
+                    <button class="btn-icon" onclick="toggleKeyVisibility('\${k.id}')" title="查看完整密钥">
+                      <svg id="eye-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      <svg id="eye-off-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                    </button>
+                    <button class="btn-icon" onclick="copyKey('\${k.id}')" title="复制密钥">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                  </span>
+                </div>
+                <div class="item-secondary"><span class="status-badge status-\${k.status}">\${k.status}</span> · 已使用 \${k.useCount} 次</div>
+              </div>
+              <div class="item-actions">
+                <button class="btn btn-success" onclick="testKey('\${k.id}')">测试</button>
+                <button class="btn btn-danger" onclick="deleteKey('\${k.id}')">删除</button>
+              </div>
+            </div>\`).join('');
+        } else container.innerHTML = '<div class="empty-state">暂无 API 密钥</div>';
+      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+    }
+
+    async function copyKey(id) {
+      try {
+        const res = await fetch('/api/keys/' + id + '/export', { headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.key) {
+          await navigator.clipboard.writeText(data.key);
+          showNotification('密钥已复制');
+        } else {
+          showNotification(data.error || '复制失败', 'error');
+        }
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    const keyFullValues = {};
+    async function toggleKeyVisibility(id) {
+      const keySpan = document.getElementById('key-' + id);
+      const eyeIcon = document.getElementById('eye-' + id);
+      const eyeOffIcon = document.getElementById('eye-off-' + id);
+      if (eyeIcon.style.display !== 'none') {
+        if (!keyFullValues[id]) {
+          try {
+            const res = await fetch('/api/keys/' + id + '/export', { headers: getAuthHeaders() });
+            const data = await res.json();
+            if (data.key) keyFullValues[id] = data.key;
+          } catch (e) { return; }
+        }
+        if (keyFullValues[id]) { keySpan.textContent = keyFullValues[id]; eyeIcon.style.display = 'none'; eyeOffIcon.style.display = 'inline'; }
+      } else { loadKeys(); }
+    }
+
+    async function deleteKey(id) {
+      if (!confirm('删除此密钥？')) return;
+      try {
+        const res = await fetch('/api/keys/' + id, { method: 'DELETE', headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.success) { showNotification('密钥已删除'); loadKeys(); }
+        else showNotification(data.error || '删除失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function testKey(id) {
+      try {
+        const res = await fetch('/api/keys/' + id + '/test', { method: 'POST', headers: getAuthHeaders() });
+        const data = await res.json();
+        showNotification(data.success ? '密钥有效' : '密钥无效: ' + (data.error || data.status), data.success ? 'success' : 'error');
+        loadKeys();
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function exportAllKeys() {
+      try {
+        const res = await fetch('/api/keys/export', { headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.keys?.length > 0) { await navigator.clipboard.writeText(data.keys.join('\\n')); showNotification(\`\${data.keys.length} 个密钥已复制\`); }
+        else showNotification('没有密钥可导出', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    // 模型管理
+    async function loadModels() {
+      try {
+        const res = await fetch('/api/models', { headers: getAuthHeaders() });
+        const data = await res.json();
+        const container = document.getElementById('modelsContainer');
+        if (data.models?.length > 0) {
+          container.innerHTML = data.models.map(m => \`
+            <div class="list-item">
+              <div class="item-info"><div class="item-primary">\${m}</div></div>
+              <div class="item-actions">
+                <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}')">测试</button>
+                <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(m)}')">删除</button>
+              </div>
+            </div>\`).join('');
+        } else container.innerHTML = '<div class="empty-state">模型池为空，使用默认模型</div>';
+      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+    }
+
+    async function addModel() {
+      const model = document.getElementById('newModel').value.trim();
+      if (!model) { showNotification('请输入模型名称', 'error'); return; }
+      try {
+        const res = await fetch('/api/models', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) });
+        const data = await res.json();
+        if (data.success) { showNotification('模型已添加'); document.getElementById('newModel').value = ''; loadModels(); }
+        else showNotification(data.error || '添加失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function deleteModel(name) {
+      if (!confirm('删除此模型？')) return;
+      try {
+        const res = await fetch('/api/models/' + name, { method: 'DELETE', headers: getAuthHeaders() });
+        const data = await res.json();
+        if (data.success) { showNotification('模型已删除'); loadModels(); }
+        else showNotification(data.error || '删除失败', 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    async function testModel(name) {
+      try {
+        const res = await fetch('/api/models/' + name + '/test', { method: 'POST', headers: getAuthHeaders() });
+        const data = await res.json();
+        showNotification(data.success ? '模型可用' : '模型不可用: ' + (data.error || data.status), data.success ? 'success' : 'error');
+      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+    }
+
+    checkAuth();
+  </script>
+</body>
+</html>`, {
+      headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/html" },
+    });
+  }
+
+  return new Response("Not Found", { status: 404 });
+}
+
+// ================================
+// 启动服务器
+// ================================
+console.log(`Cerebras Proxy 启动`);
+console.log(`- 管理面板: /`);
+console.log(`- API 代理: /v1/chat/completions`);
+console.log(`- 模型接口: /v1/models`);
+console.log(`- 存储: Deno KV`);
+
+if (import.meta.main) {
+  await bootstrapCache();
+  if (KV_FLUSH_INTERVAL_MS > 0) {
+    setInterval(flushDirtyToKv, KV_FLUSH_INTERVAL_MS);
+  }
+  serve(handler);
+}

@@ -1,0 +1,70 @@
+# 部署指南
+
+## 核心要点
+
+- 服务入口：`deno.ts`
+- 配置持久化：Deno KV
+- 管理面板：首次访问需设置密码
+- 代理鉴权：通过管理面板创建代理密钥动态控制
+
+## 部署流程
+
+### 1. 创建项目
+在 [Deno Deploy](https://dash.deno.com/) 点击 "New Project" → "Deploy from Dashboard"
+
+### 2. 粘贴源码
+将 `deno.ts` 整体拷贝到在线编辑器，保存并 Deploy
+
+### 3. 配置环境变量（可选）
+在 "Settings > Environment Variables" 中追加：
+- `KV_FLUSH_INTERVAL_MS=<刷盘间隔ms>`（可选，默认 15000）
+
+### 4. 验证部署
+访问日志，应看到：
+```
+Cerebras Proxy 启动
+- 管理面板: /
+- API 代理: /v1/chat/completions
+- 模型接口: /v1/models
+- 存储: Deno KV
+```
+
+### 5. 首次配置
+1. 浏览器打开 `https://<project>.deno.dev/`
+2. 设置管理密码（至少 4 位）
+3. 登录后添加 Cerebras API 密钥
+4. （可选）创建代理访问密钥
+
+## 运维说明
+
+### 管理面板
+- 首次访问必须设置密码
+- 登录会话有效期 7 天（过期后需重新输入密码，管理密码本身永久有效）
+- 三个标签页：访问控制、API 密钥、模型配置
+
+### 访问控制
+- 无代理密钥时：公开访问
+- 有代理密钥时：需 Bearer token 鉴权
+- 最多 5 个代理密钥
+
+### 统计刷盘
+默认每 15 秒将统计数据异步写回 KV，最终一致。可通过环境变量调整或设为 0 关闭。
+
+## 客户端配置
+
+```
+API Base: https://<project>.deno.dev/v1
+API Key: <代理密钥> 或任意（未启用鉴权时）
+Model: 任意
+```
+
+## 常见问题
+
+**"没有可用的 API 密钥"**
+至少保留一个状态为 active 的 Cerebras API 密钥。
+
+**401 Unauthorized**
+检查是否创建了代理密钥，客户端是否携带正确的 Bearer token。
+
+**统计数据跳变**
+多实例部署时各实例不共享内存缓存，统计受刷盘间隔影响。

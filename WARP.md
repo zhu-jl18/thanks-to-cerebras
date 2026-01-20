@@ -1,223 +1,78 @@
 # WARP.md
 
-这个文件为 WARP (warp.dev) 在此仓库中工作时提供指导。
+WARP (warp.dev) 在此仓库中工作时的指导。
 
 ## 项目概述
 
-这是一个 Cerebras API 代理转发项目，专为沉浸式翻译设计。通过代理机制将翻译请求路由至 Cerebras 免费 AI 推理服务，支持多 API 密钥轮换和请求限流。
+Cerebras API 代理转发项目，支持多 API 密钥轮询、代理访问密钥分发、模型池轮询。
 
 **核心特性：**
-- 四个部署版本：基础版、增强版（支持鉴权+模型映射）、Ultra v3（KV 面板，单默认模型）、Ultra v4（KV 面板 + 模型池轮询）
-- API 密钥池管理与轮询
-- 基础/增强版请求限流（固定节拍队列，适合 key 少的情况）
-- 可选密码鉴权
-- 模型名称自动映射
-- 流式响应保持
+- Deno KV 持久化存储
+- Web 管理面板
+- 代理访问密钥动态鉴权（最多 5 个）
+- Cerebras API 密钥池轮询
+- 模型池轮询
 
-## 架构说明
-
-### 代码结构
+## 代码结构
 
 ```
 .
-├── deno-v1.ts           # 基础版代理（环境变量配置）
-├── deno-v2.ts           # 增强版代理（鉴权+模型映射）
-├── deno-v3.ts           # Ultra v3（Deno KV + Web 管理面板，单默认模型）
-├── deno-v4.ts           # Ultra v4（Deno KV + Web 管理面板，模型池轮询）
+├── deno.ts              # 主程序
 ├── README.md            # 用户文档
-├── KV_DEPLOYMENT_GUIDE.md  # Ultra 版部署指南
+├── TECH_DETAILS.md      # 技术细节
+├── KV_DEPLOYMENT_GUIDE.md  # 部署指南
 └── .claude/             # Claude Code 配置
 ```
 
-### 四个版本对比
-
-| 功能 | deno-v1.ts | deno-v2.ts | deno-v3.ts | deno-v4.ts |
-|------|---------|-------------|------------------|------------------|
-| 密钥轮换 | ✅ | ✅ | ✅ | ✅ |
-| 请求限流 | ✅ | ✅ | ❌（默认直通，宁可 429） | ❌（默认直通，宁可 429） |
-| 鉴权保护 | ❌ | ✅ 可选 | ✅ 可选 | ✅ 可选 |
-| 模型映射 | ❌ | ✅ | ✅（单默认模型） | ✅（对内模型池轮询） |
-| 持久化存储 | ❌ | ❌ | ✅ Deno KV | ✅ Deno KV |
-| Web 管理面板 | ❌ | ❌ | ✅ | ✅ |
-
-### 关键技术要点
-
-**1. 密钥轮换机制**
-- 基础版和增强版：内存轮询，重启后从头开始
-- Ultra 版：Deno KV 持久化 key 池与配置；热路径用内存缓存做轮询（避免 KV 读写造成尾延迟）
-
-**2. 请求限流**
-- 基础版/增强版：`setInterval` + 请求队列
-- Ultra 版：无队列设计，直接转发；key 池不足时直接 429（不会排队等待）
-
-**3. 模型映射**
-- 增强版：硬编码默认模型 `qwen-3-235b-a22b-instruct-2507`
-- Ultra v3：默认模型写入 KV，同时缓存在内存中，转发时直接读取缓存
-- Ultra v4：真实模型由代理按模型池轮询选择；对外只暴露一个虚拟模型名
-
-**4. 鉴权方式**
-- 环境变量 `AUTH_PASSWORD`：设置后强制 Bearer token 验证
-- Ultra 版 `/api/*` 管理接口：无需鉴权（假定部署环境私有）
-
-## 常用命令
-
-### 本地开发
+## 本地开发
 
 ```bash
-# 运行基础版（需要先设置环境变量）
-$env:CEREBRAS_API_KEYS="key1,key2,key3"
-deno run --allow-net --allow-env deno-v1.ts
-
-# 运行增强版（可选鉴权）
-$env:CEREBRAS_API_KEYS="key1,key2,key3"
-$env:AUTH_PASSWORD="your-password"
-deno run --allow-net --allow-env deno-v2.ts
-
-# 运行 Ultra 版（需要 KV 权限）
-$env:AUTH_PASSWORD="your-password"  # 可选
-deno run --allow-net --allow-env --unstable-kv deno-v3.ts
-
-# 运行 Ultra v4（需要 KV 权限）
-$env:AUTH_PASSWORD="your-password"  # 可选
-deno run --allow-net --allow-env --unstable-kv deno-v4.ts
+deno run --allow-net --allow-env --unstable-kv deno.ts
 ```
 
-### 部署
+KV 数据存储在 `./kv.sqlite3`。
 
-此项目设计为部署到 **Deno Deploy**，不需要本地构建或打包：
+## API 接口
 
-1. 访问 https://dash.deno.com/
-2. 创建新项目（"New Project" → "Deploy from Dashboard"）
-3. 复制对应版本的 `.ts` 文件内容到在线编辑器
-4. 配置环境变量（基础版/增强版需要 `CEREBRAS_API_KEYS`）
-5. 点击 "Deploy" 完成部署
+### 代理接口
+- `POST /v1/chat/completions` - OpenAI 兼容
+- `GET /v1/models` - 模型列表
 
-## API 接口说明
+### 鉴权接口
+- `GET /api/auth/status` - 检查登录状态
+- `POST /api/auth/setup` - 首次设置密码
+- `POST /api/auth/login` - 登录
+- `POST /api/auth/logout` - 登出
 
-### 代理接口（所有版本）
+### 管理接口（需 X-Admin-Token）
+- `GET/POST/DELETE /api/proxy-keys` - 代理密钥管理
+- `GET/POST/DELETE /api/keys` - Cerebras API 密钥管理
+- `GET/POST/DELETE /api/models` - 模型池管理
+- `GET /api/stats` - 统计信息
+- `GET /api/config` - 配置信息
 
-- **POST** `/v1/chat/completions` - OpenAI 兼容的 Chat Completions 接口
-  - 鉴权：如设置 `AUTH_PASSWORD`，需携带 `Authorization: Bearer <password>`
-  - 请求体：标准 OpenAI Chat API 格式
-  - 响应：流式或非流式 JSON
+## 环境变量
 
-### 管理接口（仅 Ultra 版）
+- `KV_FLUSH_INTERVAL_MS` - 统计刷盘间隔（默认 15000ms）
 
-- **GET** `/` - Web 管理面板首页
-- **GET** `/v1/models` - 返回模型列表（OpenAI 兼容；v4 对外只暴露一个虚拟模型名）
-- **GET** `/api/keys` - 获取密钥列表（掩码显示）
-- **POST** `/api/keys` - 添加单个密钥
-- **POST** `/api/keys/batch` - 批量导入密钥（换行/逗号/空格分隔）
-- **DELETE** `/api/keys/:id` - 删除指定密钥
-- **POST** `/api/keys/:id/test` - 测试密钥有效性
-- **GET** `/api/stats` - 获取统计信息
-- **GET** `/api/config` - 获取当前配置
-- **PUT** `/api/config/default-model` - 更新默认模型（仅 v3）
-- **GET** `/api/models` - 获取模型池列表（仅 v4）
-- **POST** `/api/models` - 添加单个模型（仅 v4）
-- **DELETE** `/api/models/:name` - 删除指定模型（仅 v4）
-- **POST** `/api/models/:name/test` - 测试模型可用性（仅 v4）
+## KV 数据结构
 
-## 配置与环境变量
-
-### 必需环境变量（基础版/增强版）
-
-- `CEREBRAS_API_KEYS` - Cerebras API 密钥列表，逗号分隔
-
-### 可选环境变量（所有版本）
-
-- `AUTH_PASSWORD` - 代理鉴权密码，不设置则无需鉴权
-
-### 可选环境变量（Ultra 版）
-
-- `KV_FLUSH_INTERVAL_MS` - 统计信息刷盘间隔（v4 默认 15000ms；设为 `0` 可关闭）
-
-### Ultra 版特殊说明
-
-- 密钥池和默认模型/模型池通过 Web 管理面板持久化到 Deno KV
-- 首次部署后无需 `CEREBRAS_API_KEYS` 环境变量
-- Deno Deploy 自动提供 KV 存储，本地测试可指定 `DENO_KV_PATH`
-
-## 故障排查
-
-### 基础版/增强版
-
-- **"No API keys configured"**: 检查 `CEREBRAS_API_KEYS` 环境变量是否设置
-- **401 Unauthorized**: 检查 `AUTH_PASSWORD` 是否设置，客户端是否正确携带 Bearer token
-- **请求卡住**: 检查请求队列是否堆积，考虑增加 `RATE_LIMIT_MS`
-
-### Ultra 版
-
-- **"没有可用的 API 密钥"**: 至少保留一个状态为 `active` 的密钥
-- **模型更新无效**: 刷新浏览器缓存，检查 Deno Deploy 日志
-- **并发请求都打到同一个密钥**: 检查 `active` 密钥数量是否 > 1；如果你自己起了多实例，各实例不会共享轮询状态
+```typescript
+[KV_PREFIX, "meta", "config"] -> ProxyConfig
+[KV_PREFIX, "meta", "admin_password"] -> string
+[KV_PREFIX, "keys", "api", <id>] -> ApiKey
+[KV_PREFIX, "keys", "proxy", <id>] -> ProxyAuthKey
+[KV_PREFIX, "auth", "token", <token>] -> number (expiry)
+```
 
 ## 开发约定
 
-### 代码规范
-
-- 使用 TypeScript
-- Deno 标准库使用稳定版本 (std@0.192.0 或 std@0.208.0)
-- CORS 头统一在 `CORS_HEADERS` 常量中定义
-- 错误处理统一返回 JSON 格式 `{ error: string }`
-
-### 敏感信息处理
-
-- **绝不在代码中硬编码密钥**
-- 密钥显示时使用 `maskApiKey()` 掩码处理
-- `.gitignore` 已配置排除 `keys.txt`、`.env*` 等敏感文件
-- Claude Code 权限已配置禁止 git 操作（参见 `.claude/settings.local.json`）
-
-### KV 数据结构（Ultra 版）
-
-```typescript
-// 配置键
-[KV_PREFIX, "meta", "config"] → ProxyConfig {
-  modelPool: string[],
-  currentModelIndex: number,
-  currentKeyIndex: number,
-  totalRequests: number,
-  schemaVersion: string
-}
-
-// 密钥键
-[KV_PREFIX, "keys", "api", <uuid>] → ApiKey {
-  id: string,
-  key: string,
-  useCount: number,
-  lastUsed?: number,
-  status: 'active' | 'inactive' | 'invalid',
-  createdAt: number
-}
-```
-
-## 扩展开发
-
-### 添加新模型支持
-
-1. **基础版**: 不支持模型映射，需在客户端直接指定 Cerebras 支持的模型
-2. **增强版**: 修改 `DEFAULT_MODEL` 常量（第 5 行）
-3. **Ultra v3**: 通过 Web 面板或 API `/api/config/default-model` 更新默认模型
-4. **Ultra v4**: 通过 Web 面板的“模型池”或 API `/api/models` 增删模型池
-
-### 修改请求限流策略
-
-所有版本的 `RATE_LIMIT_MS` 常量定义了请求间隔（默认 200ms）。修改后重新部署即可。
-
-### 集成其他 AI 服务
-
-如需支持其他 API 提供商，需修改：
-- `CEREBRAS_API_URL` 常量
-- 请求头中的 `Authorization` 格式
-- 响应体解析逻辑（如果不兼容 OpenAI 格式）
+- TypeScript
+- Deno 标准库 std@0.208.0
+- 错误返回 `{ error: string }`
+- 密钥显示使用 `maskKey()` 掩码
 
 ## 相关资源
 
-- Cerebras 官网: https://www.cerebras.ai/
-- Deno Deploy 文档: https://deno.com/deploy
-- 原始社区分享: https://linux.do/t/topic/956453
-- 沉浸式翻译插件: 需配置 `上游地址` 为代理 URL
-
-## 免责声明
-
-本项目仅供个人学习和研究使用，代码由 Claude Code 自动生成。使用者需遵守 Cerebras 服务条款，禁止商业用途，自行承担使用风险。
+- Cerebras: https://www.cerebras.ai/
+- Deno Deploy: https://deno.com/deploy

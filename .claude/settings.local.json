@@ -3,8 +3,9 @@
     "allow": [
       "Bash(git remote set-url origin https://github.com/zhu-jl18/thanks-to-cerebras.git)",
       "Bash(git add .)",
-"Bash(git commit -m \"$(cat <<''EOF''\nfeat: 新增增强版代理支持鉴权和模型映射\n\n- 新增 deno-v2.ts 增强版代理服务\n- 支持可选鉴权功能（AUTH_PASSWORD 环境变量）\n- 支持模型名称自动映射到默认模型\n- 更新 README 技术原理和部署教程\n- 优化文档语调，更加低调务实\n\n🤖 Generated with [Claude Code](https://claude.ai/code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
-      "Bash(git push -u origin main)"
+      "Bash(git commit -m \"$(cat <<''EOF''\nfeat: 新增增强版代理支持鉴权和模型映射\n\n- 新增 deno-v2.ts 增强版代理服务\n- 支持可选鉴权功能（AUTH_PASSWORD 环境变量）\n- 支持模型名称自动映射到默认模型\n- 更新 README 技术原理和部署教程\n- 优化文档语调，更加低调务实\n\n🤖 Generated with [Claude Code](https://claude.ai/code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git push -u origin main)",
+      "Bash(deno check:*)"
     ],
     "deny": [],
     "ask": []

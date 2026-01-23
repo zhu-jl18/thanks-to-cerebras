@@ -14,6 +14,7 @@ const ADMIN_TOKEN_PREFIX = [KV_PREFIX, "auth", "token"] as const;
 const KV_ATOMIC_MAX_RETRIES = 10;
 const MAX_PROXY_KEYS = 5;
 const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
+const UPSTREAM_TEST_TIMEOUT_MS = 12000;
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const KV_FLUSH_INTERVAL_MS = (() => {
   const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
@@ -25,7 +26,7 @@ const KV_FLUSH_INTERVAL_MS = (() => {
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, DELETE, PUT',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token',
 };
 
 const NO_CACHE_HEADERS = {
@@ -130,6 +131,36 @@ function parseBatchInput(input: string): string[] {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+  if (typeof error === "object" && error !== null && "name" in error) {
+    return (error as { name?: unknown }).name === "AbortError";
+  }
+  return false;
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const externalSignal = init.signal;
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+  }
+
+  const timeoutId = setTimeout(() => controller.abort(), Math.max(0, timeoutMs));
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // 代理 API 鉴权：无密钥则公开，有密钥则验证
@@ -513,7 +544,7 @@ async function testKey(id: string): Promise<{ success: boolean; status: string; 
   const testModel = cachedModelPool.length > 0 ? cachedModelPool[0] : FALLBACK_MODEL;
 
   try {
-    const response = await fetch(CEREBRAS_API_URL, {
+    const response = await fetchWithTimeout(CEREBRAS_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -524,18 +555,20 @@ async function testKey(id: string): Promise<{ success: boolean; status: string; 
         messages: [{ role: 'user', content: 'test' }],
         max_tokens: 1,
       }),
-    });
+    }, UPSTREAM_TEST_TIMEOUT_MS);
 
     if (response.ok) {
       await kvUpdateKey(id, { status: 'active' });
       return { success: true, status: 'active' };
     } else {
-      await kvUpdateKey(id, { status: 'inactive' });
-      return { success: false, status: 'inactive', error: `HTTP ${response.status}` };
+      const nextStatus: ApiKey['status'] = (response.status === 401 || response.status === 403) ? 'invalid' : 'inactive';
+      await kvUpdateKey(id, { status: nextStatus });
+      return { success: false, status: nextStatus, error: `HTTP ${response.status}` };
     }
   } catch (error) {
-    await kvUpdateKey(id, { status: 'invalid' });
-    return { success: false, status: 'invalid', error: getErrorMessage(error) };
+    const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
+    await kvUpdateKey(id, { status: 'inactive' });
+    return { success: false, status: 'inactive', error: msg };
   }
 }
 
@@ -930,7 +963,7 @@ async function handler(req: Request): Promise<Response> {
       }
 
       try {
-        const response = await fetch(CEREBRAS_API_URL, {
+        const response = await fetchWithTimeout(CEREBRAS_API_URL, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -941,19 +974,23 @@ async function handler(req: Request): Promise<Response> {
             messages: [{ role: 'user', content: 'test' }],
             max_tokens: 1,
           }),
-        });
+        }, UPSTREAM_TEST_TIMEOUT_MS);
 
         if (response.ok) {
           return new Response(JSON.stringify({ success: true, status: 'available' }), {
             headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
           });
         } else {
+          if (response.status === 401 || response.status === 403) {
+            await kvUpdateKey(activeKey.id, { status: 'invalid' });
+          }
           return new Response(JSON.stringify({ success: false, status: 'unavailable', error: `HTTP ${response.status}` }), {
             headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
           });
         }
       } catch (error) {
-        return new Response(JSON.stringify({ success: false, status: 'error', error: getErrorMessage(error) }), {
+        const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
+        return new Response(JSON.stringify({ success: false, status: 'error', error: msg }), {
           headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
         });
       }
@@ -1157,7 +1194,7 @@ async function handler(req: Request): Promise<Response> {
     body .btn-icon:hover, body.light .btn-icon:hover { color: #06b6d4; }
     body .notification, body.light .notification {
       position: fixed; top: 16px; right: 16px; background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(8px);
-      border: 1px solid rgba(6, 182, 212, 0.2); border-radius: 8px; padding: 10px 16px; display: none; z-index: 1000;
+      border: 1px solid rgba(6, 182, 212, 0.2); border-radius: 8px; padding: 10px 16px; display: none; z-index: 10000;
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); font-size: 12px;
     }
     .notification.show { display: block; animation: slideIn 0.3s ease; }
@@ -1479,11 +1516,63 @@ async function handler(req: Request): Promise<Response> {
     });
     document.getElementById('authConfirm')?.addEventListener('keypress', (e) => { if (e.key === 'Enter') handleAuth(); });
 
+    let notificationTimer = null;
     function showNotification(message, type = 'success') {
       const notif = document.getElementById('notification');
+      if (!notif) { alert(message); return; }
+      if (notificationTimer) {
+        clearTimeout(notificationTimer);
+        notificationTimer = null;
+      }
       notif.textContent = message;
       notif.className = 'notification show ' + type;
-      setTimeout(() => notif.classList.remove('show'), 3000);
+      notif.style.display = 'block';
+      notif.style.zIndex = '10000';
+      notificationTimer = setTimeout(() => {
+        notif.classList.remove('show');
+        notif.style.display = 'none';
+        notificationTimer = null;
+      }, 3000);
+    }
+
+    function formatClientError(error) {
+      if (!error) return '未知错误';
+      if (error.name === 'AbortError') return '请求超时，请稍后重试';
+      const msg = error.message || String(error);
+      const lower = msg.toLowerCase();
+      if (lower.includes('failed to fetch') || lower.includes('networkerror') || lower.includes('err_connection_refused')) {
+        return '无法连接到本地服务（' + location.origin + '），请确认 Deno 服务在运行且端口可访问';
+      }
+      return msg;
+    }
+
+    async function fetchJsonWithTimeout(url, options, timeoutMs = 15000) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), Math.max(0, timeoutMs));
+      try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        const text = await res.text();
+        let data = {};
+        if (text) {
+          try { data = JSON.parse(text); } catch { data = { raw: text }; }
+        }
+        return { res, data };
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    function setButtonLoading(btn, loading, text) {
+      if (!btn) return;
+      if (loading) {
+        btn.dataset.oldText = btn.textContent || '';
+        btn.textContent = text || '处理中...';
+        btn.disabled = true;
+        return;
+      }
+      btn.textContent = btn.dataset.oldText || btn.textContent || '';
+      delete btn.dataset.oldText;
+      btn.disabled = false;
     }
 
     // 代理密钥管理
@@ -1631,7 +1720,7 @@ async function handler(req: Request): Promise<Response> {
                 <div class="item-secondary"><span class="status-badge status-\${k.status}">\${k.status}</span> · 已使用 \${k.useCount} 次</div>
               </div>
               <div class="item-actions">
-                <button class="btn btn-success" onclick="testKey('\${k.id}')">测试</button>
+                <button class="btn btn-success" onclick="testKey('\${k.id}', this)">测试</button>
                 <button class="btn btn-danger" onclick="deleteKey('\${k.id}')">删除</button>
               </div>
             </div>\`).join('');
@@ -1679,13 +1768,29 @@ async function handler(req: Request): Promise<Response> {
       } catch (e) { showNotification('错误: ' + e.message, 'error'); }
     }
 
-    async function testKey(id) {
+    async function testKey(id, btn) {
+      setButtonLoading(btn, true, '测试中...');
       try {
-        const res = await fetch('/api/keys/' + id + '/test', { method: 'POST', headers: getAuthHeaders() });
-        const data = await res.json();
-        showNotification(data.success ? '密钥有效' : '密钥无效: ' + (data.error || data.status), data.success ? 'success' : 'error');
+        const { res, data } = await fetchJsonWithTimeout('/api/keys/' + id + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
+        if (res.status === 401) {
+          adminToken = '';
+          localStorage.removeItem('adminToken');
+          checkAuth();
+        }
+
+        if (data.success) {
+          showNotification('密钥有效', 'success');
+        } else {
+          const detail = data.error || data.status || (res.ok ? '' : ('HTTP ' + res.status));
+          if (data.status === 'invalid') showNotification('密钥失效: ' + detail, 'error');
+          else showNotification('密钥不可用: ' + detail, 'error');
+        }
         loadKeys();
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+      } catch (e) {
+        showNotification('密钥测试失败: ' + formatClientError(e), 'error');
+      } finally {
+        setButtonLoading(btn, false);
+      }
     }
 
     async function exportAllKeys() {
@@ -1708,7 +1813,7 @@ async function handler(req: Request): Promise<Response> {
             <div class="list-item">
               <div class="item-info"><div class="item-primary">\${m}</div></div>
               <div class="item-actions">
-                <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}')">测试</button>
+                <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}', this)">测试</button>
                 <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(m)}')">删除</button>
               </div>
             </div>\`).join('');
@@ -1737,12 +1842,23 @@ async function handler(req: Request): Promise<Response> {
       } catch (e) { showNotification('错误: ' + e.message, 'error'); }
     }
 
-    async function testModel(name) {
+    async function testModel(name, btn) {
+      setButtonLoading(btn, true, '测试中...');
       try {
-        const res = await fetch('/api/models/' + name + '/test', { method: 'POST', headers: getAuthHeaders() });
-        const data = await res.json();
-        showNotification(data.success ? '模型可用' : '模型不可用: ' + (data.error || data.status), data.success ? 'success' : 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const { res, data } = await fetchJsonWithTimeout('/api/models/' + name + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
+        if (res.status === 401) {
+          adminToken = '';
+          localStorage.removeItem('adminToken');
+          checkAuth();
+        }
+        const ok = Boolean(data.success);
+        const detail = data.error || data.status || (res.ok ? '' : ('HTTP ' + res.status));
+        showNotification(ok ? '模型可用' : ('模型不可用: ' + detail), ok ? 'success' : 'error');
+      } catch (e) {
+        showNotification('模型测试失败: ' + formatClientError(e), 'error');
+      } finally {
+        setButtonLoading(btn, false);
+      }
     }
 
     checkAuth();

@@ -185,19 +185,14 @@ async function verifyAdminPassword(password: string): Promise<boolean> {
   const stored = await getAdminPassword();
   if (!stored) return false;
 
-  // 支持新格式 (salt:hash) 和旧格式 (仅 hash)
-  if (stored.includes(':')) {
-    const [salt] = stored.split(':');
-    const computed = await hashPassword(password, salt);
-    return stored === computed;
+  const parts = stored.split(':');
+  if (parts.length < 2) {
+    // 存储的密码不是预期的 'salt:hash' 格式
+    return false;
   }
-
-  // 兼容旧格式：无盐 SHA-256
-  const encoder = new TextEncoder();
-  const data = encoder.encode(password);
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  const hashHex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return stored === hashHex;
+  const [salt] = parts;
+  const computed = await hashPassword(password, salt);
+  return stored === computed;
 }
 
 async function createAdminToken(): Promise<string> {
@@ -306,6 +301,14 @@ function rebuildModelPoolCache(): void {
 }
 
 async function flushDirtyToKv(): Promise<void> {
+  // 清理过期的 cooldown 条目，防止内存泄漏（放在入口，确保低流量时也能清理）
+  const now = Date.now();
+  for (const [id, until] of keyCooldownUntil) {
+    if (until < now) {
+      keyCooldownUntil.delete(id);
+    }
+  }
+
   if (flushInProgress) return;
   if (!dirtyConfig && dirtyKeyIds.size === 0 && dirtyProxyKeyIds.size === 0) return;
   if (!cachedConfig) return;
@@ -341,14 +344,6 @@ async function flushDirtyToKv(): Promise<void> {
     console.error(`[KV] flush failed:`, error);
   } finally {
     flushInProgress = false;
-  }
-
-  // 清理过期的 cooldown 条目，防止内存泄漏
-  const now = Date.now();
-  for (const [id, until] of keyCooldownUntil) {
-    if (until < now) {
-      keyCooldownUntil.delete(id);
-    }
   }
 }
 

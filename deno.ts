@@ -13,6 +13,7 @@ const ADMIN_PASSWORD_KEY = [KV_PREFIX, "meta", "admin_password"] as const;
 const ADMIN_TOKEN_PREFIX = [KV_PREFIX, "auth", "token"] as const;
 const KV_ATOMIC_MAX_RETRIES = 10;
 const MAX_PROXY_KEYS = 5;
+const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const KV_FLUSH_INTERVAL_MS = (() => {
   const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
@@ -110,11 +111,9 @@ function generateId(): string {
 
 function generateProxyKey(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = 'cpk_';
-  for (let i = 0; i < 32; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+  const randomValues = new Uint32Array(32);
+  crypto.getRandomValues(randomValues);
+  return 'cpk_' + Array.from(randomValues, v => chars[v % chars.length]).join('');
 }
 
 function maskKey(key: string): string {
@@ -163,11 +162,13 @@ function recordProxyKeyUsage(keyId: string): void {
 }
 
 // 管理面板鉴权
-async function hashPassword(password: string): Promise<string> {
+async function hashPassword(password: string, salt?: string): Promise<string> {
+  const actualSalt = salt ?? crypto.randomUUID();
   const encoder = new TextEncoder();
-  const data = encoder.encode(password);
+  const data = encoder.encode(actualSalt + password);
   const hash = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const hashHex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `${actualSalt}:${hashHex}`;
 }
 
 async function getAdminPassword(): Promise<string | null> {
@@ -181,15 +182,27 @@ async function setAdminPassword(password: string): Promise<void> {
 }
 
 async function verifyAdminPassword(password: string): Promise<boolean> {
-  const storedHash = await getAdminPassword();
-  if (!storedHash) return false;
-  const inputHash = await hashPassword(password);
-  return storedHash === inputHash;
+  const stored = await getAdminPassword();
+  if (!stored) return false;
+
+  // 支持新格式 (salt:hash) 和旧格式 (仅 hash)
+  if (stored.includes(':')) {
+    const [salt] = stored.split(':');
+    const computed = await hashPassword(password, salt);
+    return stored === computed;
+  }
+
+  // 兼容旧格式：无盐 SHA-256
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const hashHex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return stored === hashHex;
 }
 
 async function createAdminToken(): Promise<string> {
   const token = crypto.randomUUID();
-  const expiry = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  const expiry = Date.now() + ADMIN_TOKEN_EXPIRY_MS;
   await kv.set([...ADMIN_TOKEN_PREFIX, token], expiry);
   return token;
 }
@@ -328,6 +341,14 @@ async function flushDirtyToKv(): Promise<void> {
     console.error(`[KV] flush failed:`, error);
   } finally {
     flushInProgress = false;
+  }
+
+  // 清理过期的 cooldown 条目，防止内存泄漏
+  const now = Date.now();
+  for (const [id, until] of keyCooldownUntil) {
+    if (until < now) {
+      keyCooldownUntil.delete(id);
+    }
   }
 }
 

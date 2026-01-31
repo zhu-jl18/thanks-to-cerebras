@@ -1,5 +1,7 @@
 // deno.ts - Cerebras API 代理与密钥管理系统
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+import { hashPassword, verifyPbkdf2Password } from "./src/crypto.ts";
+import { generateProxyKey } from "./src/keys.ts";
 
 // ================================
 // 配置常量
@@ -15,8 +17,6 @@ const KV_ATOMIC_MAX_RETRIES = 10;
 const MAX_PROXY_KEYS = 5;
 const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 const UPSTREAM_TEST_TIMEOUT_MS = 12000;
-const PBKDF2_ITERATIONS = 100000; // PBKDF2 迭代次数
-const PBKDF2_KEY_LENGTH = 32; // 派生密钥长度（字节）
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const KV_FLUSH_INTERVAL_MS = (() => {
   const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
@@ -114,17 +114,6 @@ function generateId(): string {
   return crypto.randomUUID();
 }
 
-function generateProxyKey(): string {
-  // 生成 24 字节随机数据，base64url 编码后约 32 字符
-  const randomBytes = crypto.getRandomValues(new Uint8Array(24));
-  // base64url 编码：使用 - 和 _ 替代 + 和 /，移除 =
-  const base64 = btoa(String.fromCharCode(...randomBytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=/g, "");
-  return "cpk_" + base64;
-}
-
 function maskKey(key: string): string {
   if (key.length <= 8) return "*".repeat(key.length);
   return key.substring(0, 4) + "*".repeat(key.length - 8) +
@@ -213,40 +202,6 @@ function recordProxyKeyUsage(keyId: string): void {
 }
 
 // 管理面板鉴权
-async function hashPassword(
-  password: string,
-  salt?: Uint8Array,
-): Promise<string> {
-  const actualSalt = salt ?? crypto.getRandomValues(new Uint8Array(16));
-
-  const encoder = new TextEncoder();
-  const passwordKey = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      salt: actualSalt.buffer as ArrayBuffer,
-      iterations: PBKDF2_ITERATIONS,
-      hash: "SHA-256",
-    },
-    passwordKey,
-    PBKDF2_KEY_LENGTH * 8,
-  );
-
-  const derivedKey = new Uint8Array(derivedBits);
-
-  // 版本化格式：v1$pbkdf2$<iters>$<salt_b64>$<key_b64>
-  const saltB64 = btoa(String.fromCharCode(...actualSalt));
-  const keyB64 = btoa(String.fromCharCode(...derivedKey));
-  return `v1$pbkdf2$${PBKDF2_ITERATIONS}$${saltB64}$${keyB64}`;
-}
-
 async function getAdminPassword(): Promise<string | null> {
   const entry = await kv.get<string>(ADMIN_PASSWORD_KEY);
   return entry.value;
@@ -260,56 +215,7 @@ async function setAdminPassword(password: string): Promise<void> {
 async function verifyAdminPassword(password: string): Promise<boolean> {
   const stored = await getAdminPassword();
   if (!stored) return false;
-
-  const parts = stored.split("$");
-
-  // 检查版本化格式：v1$pbkdf2$<iters>$<salt_b64>$<key_b64>
-  if (parts.length === 5 && parts[0] === "v1" && parts[1] === "pbkdf2") {
-    const iterations = Number.parseInt(parts[2], 10);
-    const saltB64 = parts[3];
-    const storedKeyB64 = parts[4];
-
-    // 解码 base64
-    const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
-    const storedKey = Uint8Array.from(
-      atob(storedKeyB64),
-      (c) => c.charCodeAt(0),
-    );
-
-    // 使用相同参数重新计算
-    const encoder = new TextEncoder();
-    const passwordKey = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode(password),
-      "PBKDF2",
-      false,
-      ["deriveBits"],
-    );
-
-    const derivedBits = await crypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        salt: salt.buffer as ArrayBuffer,
-        iterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      storedKey.length * 8,
-    );
-
-    const computedKey = new Uint8Array(derivedBits);
-
-    // 常量时间比较
-    if (computedKey.length !== storedKey.length) return false;
-    let diff = 0;
-    for (let i = 0; i < computedKey.length; i++) {
-      diff |= computedKey[i] ^ storedKey[i];
-    }
-    return diff === 0;
-  }
-
-  // 不支持的格式
-  return false;
+  return await verifyPbkdf2Password(password, stored);
 }
 
 async function createAdminToken(): Promise<string> {

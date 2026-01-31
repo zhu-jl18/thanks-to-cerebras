@@ -41,7 +41,7 @@ const NO_CACHE_HEADERS = {
 // Deno KV 存储
 // ================================
 const isDenoDeployment = Boolean(Deno.env.get("DENO_DEPLOYMENT_ID"));
-const kv = await (async () => {
+const kv = await (() => {
   if (isDenoDeployment) return Deno.openKv();
   const kvDir = `${import.meta.dirname}/.deno-kv-local`;
   try { Deno.mkdirSync(kvDir, { recursive: true }); } catch { /* exists */ }
@@ -170,7 +170,7 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, tim
 }
 
 // 代理 API 鉴权：无密钥则公开，有密钥则验证
-async function isProxyAuthorized(req: Request): Promise<{ authorized: boolean; keyId?: string }> {
+function isProxyAuthorized(req: Request): { authorized: boolean; keyId?: string } {
   if (cachedProxyKeys.size === 0) {
     return { authorized: true };
   }
@@ -1086,7 +1086,7 @@ async function handler(req: Request): Promise<Response> {
 
   // POST /v1/chat/completions - 代理转发
   if (req.method === 'POST' && path === '/v1/chat/completions') {
-    const authResult = await isProxyAuthorized(req);
+    const authResult = isProxyAuthorized(req);
     if (!authResult.authorized) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,

@@ -4,103 +4,12 @@ import {
   assertMatch,
 } from "https://deno.land/std@0.208.0/assert/mod.ts";
 
-// 导入需要测试的函数（这里使用动态导入以避免副作用）
-const PBKDF2_ITERATIONS = 100000;
-
-// ================================
-// 辅助函数（从 deno.ts 复制用于测试）
-// ================================
-async function hashPassword(
-  password: string,
-  salt?: Uint8Array,
-): Promise<string> {
-  const actualSalt = salt ?? crypto.getRandomValues(new Uint8Array(16));
-
-  const encoder = new TextEncoder();
-  const passwordKey = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      salt: actualSalt.buffer as ArrayBuffer,
-      iterations: PBKDF2_ITERATIONS,
-      hash: "SHA-256",
-    },
-    passwordKey,
-    32 * 8,
-  );
-
-  const derivedKey = new Uint8Array(derivedBits);
-
-  const saltB64 = btoa(String.fromCharCode(...actualSalt));
-  const keyB64 = btoa(String.fromCharCode(...derivedKey));
-  return `v1$pbkdf2$${PBKDF2_ITERATIONS}$${saltB64}$${keyB64}`;
-}
-
-async function verifyAdminPassword(
-  password: string,
-  stored: string,
-): Promise<boolean> {
-  const parts = stored.split("$");
-
-  if (parts.length === 5 && parts[0] === "v1" && parts[1] === "pbkdf2") {
-    const iterations = Number.parseInt(parts[2], 10);
-    const saltB64 = parts[3];
-    const storedKeyB64 = parts[4];
-
-    const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
-    const storedKey = Uint8Array.from(
-      atob(storedKeyB64),
-      (c) => c.charCodeAt(0),
-    );
-
-    const encoder = new TextEncoder();
-    const passwordKey = await crypto.subtle.importKey(
-      "raw",
-      encoder.encode(password),
-      "PBKDF2",
-      false,
-      ["deriveBits"],
-    );
-
-    const derivedBits = await crypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        salt: salt.buffer as ArrayBuffer,
-        iterations,
-        hash: "SHA-256",
-      },
-      passwordKey,
-      storedKey.length * 8,
-    );
-
-    const computedKey = new Uint8Array(derivedBits);
-
-    if (computedKey.length !== storedKey.length) return false;
-    let diff = 0;
-    for (let i = 0; i < computedKey.length; i++) {
-      diff |= computedKey[i] ^ storedKey[i];
-    }
-    return diff === 0;
-  }
-
-  return false;
-}
-
-function generateProxyKey(): string {
-  const randomBytes = crypto.getRandomValues(new Uint8Array(24));
-  const base64 = btoa(String.fromCharCode(...randomBytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=/g, "");
-  return "cpk_" + base64;
-}
+import {
+  hashPassword,
+  PBKDF2_ITERATIONS,
+  verifyPbkdf2Password,
+} from "./src/crypto.ts";
+import { generateProxyKey } from "./src/keys.ts";
 
 // ================================
 // 测试用例
@@ -158,23 +67,23 @@ Deno.test("hashPassword - 相同密码不同盐产生不同哈希", async () => 
   assertEquals(hash1 !== hash2, true, "相同密码应产生不同哈希（不同盐）");
 });
 
-Deno.test("verifyAdminPassword - 正确密码验证成功", async () => {
+Deno.test("verifyPbkdf2Password - 正确密码验证成功", async () => {
   const password = "mypassword";
   const hash = await hashPassword(password);
-  const result = await verifyAdminPassword(password, hash);
+  const result = await verifyPbkdf2Password(password, hash);
 
   assertEquals(result, true, "正确密码应验证成功");
 });
 
-Deno.test("verifyAdminPassword - 错误密码验证失败", async () => {
+Deno.test("verifyPbkdf2Password - 错误密码验证失败", async () => {
   const password = "mypassword";
   const hash = await hashPassword(password);
-  const result = await verifyAdminPassword("wrongpassword", hash);
+  const result = await verifyPbkdf2Password("wrongpassword", hash);
 
   assertEquals(result, false, "错误密码应验证失败");
 });
 
-Deno.test("verifyAdminPassword - 格式错误的哈希拒绝", async () => {
+Deno.test("verifyPbkdf2Password - 格式错误的哈希拒绝", async () => {
   const invalidHashes = [
     "invalid",
     "v1$pbkdf2$100000", // 缺少部分
@@ -183,20 +92,20 @@ Deno.test("verifyAdminPassword - 格式错误的哈希拒绝", async () => {
   ];
 
   for (const hash of invalidHashes) {
-    const result = await verifyAdminPassword("anypassword", hash);
+    const result = await verifyPbkdf2Password("anypassword", hash);
     assertEquals(result, false, `格式错误的哈希应拒绝：${hash}`);
   }
 });
 
-Deno.test("verifyAdminPassword - 确定性验证（相同输入相同结果）", async () => {
+Deno.test("verifyPbkdf2Password - 确定性验证（相同输入相同结果）", async () => {
   const password = "test123";
   const salt = new Uint8Array(16).fill(42); // 固定盐
   const hash = await hashPassword(password, salt);
 
   // 多次验证应得到相同结果
-  const result1 = await verifyAdminPassword(password, hash);
-  const result2 = await verifyAdminPassword(password, hash);
-  const result3 = await verifyAdminPassword(password, hash);
+  const result1 = await verifyPbkdf2Password(password, hash);
+  const result2 = await verifyPbkdf2Password(password, hash);
+  const result3 = await verifyPbkdf2Password(password, hash);
 
   assertEquals(result1, true);
   assertEquals(result2, true);

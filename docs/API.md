@@ -7,8 +7,10 @@
 - `OPTIONS` 预检请求统一返回 `204`。
 - JSON 响应默认带 `Cache-Control: no-store`（用于避免缓存敏感数据/统计）。
 
-> 注意：管理 API（`/api/*`）目前错误返回主要是 `{ "error": string }`。
-> 我们已经创建 issue #34，计划将所有非 2xx 错误统一升级到更标准的 Problem Details（`application/problem+json`）。
+> 管理 API（`/api/*`）的非 2xx 错误采用 Problem Details：
+>
+> - `Content-Type: application/problem+json`
+> - Body: `{ type, title, status, detail, instance? }`
 
 ## 1. 鉴权模型
 
@@ -38,6 +40,7 @@
   - 流式响应会直接透传上游 response body
 
 常见响应码：
+
 - `401`：代理访问未授权（启用了代理密钥但没带/带错 Bearer token）
 - `429`：当前没有可用 API key（全部处于冷却/不可用等）
 

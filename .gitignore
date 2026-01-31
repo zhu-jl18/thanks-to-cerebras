@@ -38,8 +38,9 @@ Desktop.ini
 *.sublime-workspace
 *.sublime-project
 
-# Claude / Codex local artifacts
-.claude/skills/
+# Local AI assistant artifacts (do not commit)
+WARP.md
+.claude/
 
 # ===================================================================
 # LOGS & DEPENDENCIES

@@ -74,7 +74,6 @@ interface ProxyAuthKey {
 interface ProxyConfig {
   modelPool: string[];
   currentModelIndex: number;
-  currentKeyIndex: number;
   totalRequests: number;
   schemaVersion: string;
 }
@@ -400,9 +399,8 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
     const defaultConfig: ProxyConfig = {
       modelPool: [...DEFAULT_MODEL_POOL],
       currentModelIndex: 0,
-      currentKeyIndex: 0,
       totalRequests: 0,
-      schemaVersion: "3.0",
+      schemaVersion: "3.1",
     };
     await kv.set(CONFIG_KEY, defaultConfig);
     entry = await kv.get<ProxyConfig>(CONFIG_KEY);

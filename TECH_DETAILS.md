@@ -45,7 +45,7 @@ async function isProxyAuthorized(req: Request) {
   modelPool: string[],
   currentModelIndex: number,
   totalRequests: number,
-  schemaVersion: '3.0'
+  schemaVersion: '3.1'
 }
 
 // 管理员密码

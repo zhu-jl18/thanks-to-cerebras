@@ -1,0 +1,78 @@
+name: ci
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v2.x
+      - name: deno fmt --check
+        run: deno fmt --check deno.ts deno_test.ts
+      - name: deno lint
+        run: deno lint deno.ts deno_test.ts
+      - name: deno check
+        run: deno check deno.ts deno_test.ts
+      - name: deno test
+        run: deno test deno_test.ts
+  publish_bundle:
+    needs: [quality]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v2.x
+      - name: Bundle
+        run: |
+          rm -rf dist .bundle-artifacts
+          mkdir -p dist .bundle-artifacts
+          deno bundle deno.ts -o dist/deno.bundle.js
+          deno bundle deno.ts -o dist/deno.bundle.min.js --minify
+          cp -r dist .bundle-artifacts/dist
+      - name: Publish to bundle branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan bundle
+          git rm -rf .
+
+          rm -rf dist
+          cp -r .bundle-artifacts/dist dist
+          rm -rf .bundle-artifacts
+
+          cat > README.md <<'EOF'
+          # Deploy artifact (bundle)
+
+          This branch contains single-file bundle artifacts for Deno Deploy copy/paste.
+
+          Files:
+          - dist/deno.bundle.js (readable)
+          - dist/deno.bundle.min.js (minified, recommended)
+          EOF
+
+          git add dist README.md
+
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+
+          git commit -m "chore(bundle): update deploy artifacts"
+          git push -f origin bundle

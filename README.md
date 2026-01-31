@@ -61,7 +61,10 @@
 
 2. 部署到 Deno:
    * 打开 [Deno Deploy](https://dash.deno.com/) 并新建 `Playground`。
-   * 把 `deno.ts` 的代码粘贴进去并部署。
+   * **傻瓜版（推荐）**：打开下面任意一个文件，全选复制后粘贴到 Playground 并部署：
+     * `dist/deno.bundle.min.js`（推荐，体积更小）：https://github.com/zhu-jl18/thanks-to-cerebras/blob/bundle/dist/deno.bundle.min.js
+     * `dist/deno.bundle.js`（可读版本）：https://github.com/zhu-jl18/thanks-to-cerebras/blob/bundle/dist/deno.bundle.js
+   * **开发者版**：直接把 `deno.ts` 的代码粘贴进去并部署（或使用 GitHub 绑定部署）。
    * (Optional) 配置环境变量`KV_FLUSH_INTERVAL_MS=<刷盘间隔ms>`，默认 15000。
     <div align="center">
       <p>Deno Deploy 配置</p>

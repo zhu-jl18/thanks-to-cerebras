@@ -54,6 +54,10 @@
 - 使用者需自行承担因使用本项目而产生的任何风险和责任
 - 作者不对因使用本项目导致的任何直接或间接损失负责
 
+## License
+
+本项目以 MIT License 开源，详见 `LICENSE`。
+
 ## Get Started
 
 1. 获取 Cerebras Key:

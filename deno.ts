@@ -37,6 +37,36 @@ const NO_CACHE_HEADERS = {
   "Expires": "0",
 };
 
+function jsonResponse(
+  data: unknown,
+  options: { status?: number; headers?: HeadersInit } = {},
+): Response {
+  const headers = new Headers({
+    ...CORS_HEADERS,
+    ...NO_CACHE_HEADERS,
+    "Content-Type": "application/json",
+  });
+
+  if (options.headers) {
+    new Headers(options.headers).forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+
+  return new Response(JSON.stringify(data), {
+    status: options.status ?? 200,
+    headers,
+  });
+}
+
+function jsonError(
+  message: string,
+  status = 400,
+  headers?: HeadersInit,
+): Response {
+  return jsonResponse({ error: message }, { status, headers });
+}
+
 // ================================
 // Deno KV 存储
 // ================================
@@ -616,41 +646,24 @@ async function handler(req: Request): Promise<Response> {
       const hasPassword = await getAdminPassword() !== null;
       const token = req.headers.get("X-Admin-Token");
       const isLoggedIn = await verifyAdminToken(token);
-      return new Response(JSON.stringify({ hasPassword, isLoggedIn }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ hasPassword, isLoggedIn });
     }
 
     if (req.method === "POST" && path === "/api/auth/setup") {
       const hasPassword = await getAdminPassword() !== null;
       if (hasPassword) {
-        return new Response(JSON.stringify({ error: "密码已设置" }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: "密码已设置" }, { status: 400 });
       }
       try {
         const { password } = await req.json();
         if (!password || password.length < 4) {
-          return new Response(JSON.stringify({ error: "密码至少 4 位" }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonResponse({ error: "密码至少 4 位" }, { status: 400 });
         }
         await setAdminPassword(password);
         const token = await createAdminToken();
-        return new Response(JSON.stringify({ success: true, token }), {
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ success: true, token });
       } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
       }
     }
 
@@ -659,20 +672,12 @@ async function handler(req: Request): Promise<Response> {
         const { password } = await req.json();
         const valid = await verifyAdminPassword(password);
         if (!valid) {
-          return new Response(JSON.stringify({ error: "密码错误" }), {
-            status: 401,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonResponse({ error: "密码错误" }, { status: 401 });
         }
         const token = await createAdminToken();
-        return new Response(JSON.stringify({ success: true, token }), {
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ success: true, token });
       } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
       }
     }
 
@@ -681,24 +686,16 @@ async function handler(req: Request): Promise<Response> {
       if (token) {
         await kv.delete([...ADMIN_TOKEN_PREFIX, token]);
       }
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse({ success: true });
     }
 
-    return new Response(JSON.stringify({ error: "Not Found" }), {
-      status: 404,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
+    return jsonResponse({ error: "Not Found" }, { status: 404 });
   }
 
   // 受保护的管理 API
   if (path.startsWith("/api/")) {
     if (!await isAdminAuthorized(req)) {
-      return new Response(JSON.stringify({ error: "未登录" }), {
-        status: 401,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse({ error: "未登录" }, { status: 401 });
     }
 
     // ========== 代理鉴权密钥管理 ==========
@@ -712,45 +709,27 @@ async function handler(req: Request): Promise<Response> {
         lastUsed: k.lastUsed,
         createdAt: k.createdAt,
       }));
-      return new Response(
-        JSON.stringify({
-          keys: masked,
-          maxKeys: MAX_PROXY_KEYS,
-          authEnabled: cachedProxyKeys.size > 0,
-        }),
-        {
-          headers: {
-            ...CORS_HEADERS,
-            ...NO_CACHE_HEADERS,
-            "Content-Type": "application/json",
-          },
-        },
-      );
+      return jsonResponse({
+        keys: masked,
+        maxKeys: MAX_PROXY_KEYS,
+        authEnabled: cachedProxyKeys.size > 0,
+      });
     }
 
     if (req.method === "POST" && path === "/api/proxy-keys") {
       try {
         const { name } = await req.json().catch(() => ({ name: "" }));
         const result = await kvAddProxyKey(name);
-        return new Response(JSON.stringify(result), {
-          status: result.success ? 201 : 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse(result, { status: result.success ? 201 : 400 });
       } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
       }
     }
 
     if (req.method === "DELETE" && path.startsWith("/api/proxy-keys/")) {
       const id = path.split("/").pop()!;
       const result = await kvDeleteProxyKey(id);
-      return new Response(JSON.stringify(result), {
-        status: result.success ? 200 : 400,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse(result, { status: result.success ? 200 : 400 });
     }
 
     if (
@@ -760,18 +739,9 @@ async function handler(req: Request): Promise<Response> {
       const id = path.split("/")[3];
       const pk = cachedProxyKeys.get(id);
       if (!pk) {
-        return new Response(JSON.stringify({ error: "密钥不存在" }), {
-          status: 404,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: "密钥不存在" }, { status: 404 });
       }
-      return new Response(JSON.stringify({ key: pk.key }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ key: pk.key });
     }
 
     // ========== Cerebras API 密钥管理 ==========
@@ -781,35 +751,20 @@ async function handler(req: Request): Promise<Response> {
         ...k,
         key: maskKey(k.key),
       }));
-      return new Response(JSON.stringify({ keys: maskedKeys }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ keys: maskedKeys });
     }
 
     if (req.method === "POST" && path === "/api/keys") {
       try {
         const { key } = await req.json();
         if (!key) {
-          return new Response(JSON.stringify({ error: "密钥不能为空" }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonResponse({ error: "密钥不能为空" }, { status: 400 });
         }
 
         const result = await kvAddKey(key);
-        return new Response(JSON.stringify(result), {
-          status: result.success ? 201 : 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse(result, { status: result.success ? 201 : 400 });
       } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
       }
     }
 
@@ -826,10 +781,7 @@ async function handler(req: Request): Promise<Response> {
         }
 
         if (!input?.trim()) {
-          return new Response(JSON.stringify({ error: "输入不能为空" }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonResponse({ error: "输入不能为空" }, { status: 400 });
         }
 
         const keys = parseBatchInput(input);
@@ -850,37 +802,23 @@ async function handler(req: Request): Promise<Response> {
           }
         }
 
-        return new Response(
-          JSON.stringify({
-            summary: {
-              total: keys.length,
-              success: results.success.length,
-              failed: results.failed.length,
-            },
-            results,
-          }),
-          {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+        return jsonResponse({
+          summary: {
+            total: keys.length,
+            success: results.success.length,
+            failed: results.failed.length,
           },
-        );
-      } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          results,
         });
+      } catch (error) {
+        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
       }
     }
 
     if (req.method === "GET" && path === "/api/keys/export") {
       const keys = Array.from(cachedKeysById.values());
       const rawKeys = keys.map((k) => k.key);
-      return new Response(JSON.stringify({ keys: rawKeys }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ keys: rawKeys });
     }
 
     if (
@@ -890,27 +828,15 @@ async function handler(req: Request): Promise<Response> {
       const id = path.split("/")[3];
       const keyEntry = cachedKeysById.get(id);
       if (!keyEntry) {
-        return new Response(JSON.stringify({ error: "密钥不存在" }), {
-          status: 404,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonError("密钥不存在", 404);
       }
-      return new Response(JSON.stringify({ key: keyEntry.key }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ key: keyEntry.key });
     }
 
     if (req.method === "DELETE" && path.startsWith("/api/keys/")) {
       const id = path.split("/").pop()!;
       const result = await kvDeleteKey(id);
-      return new Response(JSON.stringify(result), {
-        status: result.success ? 200 : 400,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse(result, { status: result.success ? 200 : 400 });
     }
 
     if (
@@ -919,9 +845,7 @@ async function handler(req: Request): Promise<Response> {
     ) {
       const id = path.split("/")[3];
       const result = await testKey(id);
-      return new Response(JSON.stringify(result), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse(result);
     }
 
     // ========== 统计和配置 ==========
@@ -938,24 +862,12 @@ async function handler(req: Request): Promise<Response> {
           status: k.status,
         })),
       };
-      return new Response(JSON.stringify(stats), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse(stats);
     }
 
     if (req.method === "GET" && path === "/api/config") {
       const config = await kvGetConfig();
-      return new Response(JSON.stringify(config), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse(config);
     }
 
     // ========== 模型池管理 ==========
@@ -964,31 +876,19 @@ async function handler(req: Request): Promise<Response> {
       const models = config.modelPool?.length > 0
         ? config.modelPool
         : DEFAULT_MODEL_POOL;
-      return new Response(JSON.stringify({ models }), {
-        headers: {
-          ...CORS_HEADERS,
-          ...NO_CACHE_HEADERS,
-          "Content-Type": "application/json",
-        },
-      });
+      return jsonResponse({ models });
     }
 
     if (req.method === "POST" && path === "/api/models") {
       try {
         const { model } = await req.json();
         if (!model?.trim()) {
-          return new Response(JSON.stringify({ error: "模型名称不能为空" }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonError("模型名称不能为空");
         }
 
         const trimmedModel = model.trim();
         if (cachedModelPool.includes(trimmedModel)) {
-          return new Response(JSON.stringify({ error: "模型已存在" }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return jsonError("模型已存在");
         }
 
         await kvUpdateConfig((config) => ({
@@ -997,18 +897,12 @@ async function handler(req: Request): Promise<Response> {
         }));
         rebuildModelPoolCache();
 
-        return new Response(
-          JSON.stringify({ success: true, model: trimmedModel }),
-          {
-            status: 201,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          },
+        return jsonResponse(
+          { success: true, model: trimmedModel },
+          { status: 201 },
         );
       } catch (error) {
-        return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonError(getErrorMessage(error));
       }
     }
 
@@ -1017,10 +911,7 @@ async function handler(req: Request): Promise<Response> {
       const modelName = decodeURIComponent(encodedName);
 
       if (!cachedModelPool.includes(modelName)) {
-        return new Response(JSON.stringify({ error: "模型不存在" }), {
-          status: 404,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return jsonError("模型不存在", 404);
       }
 
       await kvUpdateConfig((config) => ({
@@ -1030,9 +921,7 @@ async function handler(req: Request): Promise<Response> {
       }));
       rebuildModelPoolCache();
 
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonResponse({ success: true });
     }
 
     if (
@@ -1047,12 +936,9 @@ async function handler(req: Request): Promise<Response> {
         k.status === "active"
       );
       if (!activeKey) {
-        return new Response(
-          JSON.stringify({ success: false, error: "没有可用的 API 密钥" }),
-          {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          },
+        return jsonResponse(
+          { success: false, error: "没有可用的 API 密钥" },
+          { status: 400 },
         );
       }
 
@@ -1071,71 +957,45 @@ async function handler(req: Request): Promise<Response> {
         }, UPSTREAM_TEST_TIMEOUT_MS);
 
         if (response.ok) {
-          return new Response(
-            JSON.stringify({ success: true, status: "available" }),
-            {
-              headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-            },
-          );
+          return jsonResponse({ success: true, status: "available" });
         } else {
           if (response.status === 401 || response.status === 403) {
             await kvUpdateKey(activeKey.id, { status: "invalid" });
           }
-          return new Response(
-            JSON.stringify({
-              success: false,
-              status: "unavailable",
-              error: `HTTP ${response.status}`,
-            }),
-            {
-              headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-            },
-          );
+          return jsonResponse({
+            success: false,
+            status: "unavailable",
+            error: `HTTP ${response.status}`,
+          });
         }
       } catch (error) {
         const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
-        return new Response(
-          JSON.stringify({ success: false, status: "error", error: msg }),
-          {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          },
-        );
+        return jsonResponse({ success: false, status: "error", error: msg });
       }
     }
 
-    return new Response(JSON.stringify({ error: "Not Found" }), {
-      status: 404,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
+    return jsonError("Not Found", 404);
   }
 
   // GET /v1/models - OpenAI 兼容
   if (req.method === "GET" && path === "/v1/models") {
     const now = Math.floor(Date.now() / 1000);
-    return new Response(
-      JSON.stringify({
-        object: "list",
-        data: [{
-          id: EXTERNAL_MODEL_ID,
-          object: "model",
-          created: now,
-          owned_by: "cerebras",
-        }],
-      }),
-      {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      },
-    );
+    return jsonResponse({
+      object: "list",
+      data: [{
+        id: EXTERNAL_MODEL_ID,
+        object: "model",
+        created: now,
+        owned_by: "cerebras",
+      }],
+    });
   }
 
   // POST /v1/chat/completions - 代理转发
   if (req.method === "POST" && path === "/v1/chat/completions") {
     const authResult = isProxyAuthorized(req);
     if (!authResult.authorized) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonError("Unauthorized", 401);
     }
 
     if (authResult.keyId) {
@@ -1160,16 +1020,13 @@ async function handler(req: Request): Promise<Response> {
           ? Math.ceil((minCooldownUntil - now) / 1000)
           : 0;
 
-        return new Response(JSON.stringify({ error: "没有可用的 API 密钥" }), {
-          status: cachedActiveKeyIds.length > 0 ? 429 : 500,
-          headers: {
-            ...CORS_HEADERS,
-            "Content-Type": "application/json",
-            ...(retryAfterSeconds > 0
-              ? { "Retry-After": String(retryAfterSeconds) }
-              : {}),
-          },
-        });
+        return jsonError(
+          "没有可用的 API 密钥",
+          cachedActiveKeyIds.length > 0 ? 429 : 500,
+          retryAfterSeconds > 0
+            ? { "Retry-After": String(retryAfterSeconds) }
+            : undefined,
+        );
       }
 
       const apiResponse = await fetch(CEREBRAS_API_URL, {
@@ -1192,6 +1049,9 @@ async function handler(req: Request): Promise<Response> {
       Object.entries(CORS_HEADERS).forEach(([key, value]) => {
         responseHeaders.set(key, value);
       });
+      Object.entries(NO_CACHE_HEADERS).forEach(([key, value]) => {
+        responseHeaders.set(key, value);
+      });
 
       return new Response(apiResponse.body, {
         status: apiResponse.status,
@@ -1199,10 +1059,7 @@ async function handler(req: Request): Promise<Response> {
         headers: responseHeaders,
       });
     } catch (error) {
-      return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
-        status: 400,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
+      return jsonError(getErrorMessage(error));
     }
   }
 

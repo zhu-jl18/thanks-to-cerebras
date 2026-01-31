@@ -45,6 +45,7 @@ function isProxyAuthorized(req: Request) {
   modelPool: string[],
   currentModelIndex: number,
   totalRequests: number,
+  kvFlushIntervalMs: number,
   schemaVersion: '3.1'
 }
 
@@ -71,10 +72,12 @@ function isProxyAuthorized(req: Request) {
 ## KV 写入量估算
 
 默认每 15 秒 flush 一次，写入次数约为：
+
 - `U + P + 1`（U=脏 API 密钥数，P=脏代理密钥数，1=config）
 
 个人项目（5-10 keys，每天用 1 小时）通常在免费额度内。
 
 ## 本地运行
 
-本地运行时 KV 自动存储在 `.deno-kv-local/kv.sqlite3`（通过检测 `DENO_DEPLOYMENT_ID` 判断环境）。
+本地运行时 KV 自动存储在 `.deno-kv-local/kv.sqlite3`（通过检测
+`DENO_DEPLOYMENT_ID` 判断环境）。

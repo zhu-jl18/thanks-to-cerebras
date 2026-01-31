@@ -104,6 +104,16 @@
 
 ### 4.3 模型池（Models）
 
+模型目录（Catalog）：
+
+- `GET /api/models/catalog`
+  - 描述：从 Cerebras public models API 拉取并缓存“可用模型列表”。
+  - 返回：`models`、`fetchedAt`、`ttlMs`、`stale`、`lastError?`
+- `POST /api/models/catalog/refresh`
+  - 描述：强制刷新模型目录。
+
+模型池（Pool）：
+
 - `GET /api/models`
 - `POST /api/models`
   - 请求体：`{ "model": string }`

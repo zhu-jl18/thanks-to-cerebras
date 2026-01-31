@@ -7,8 +7,10 @@ import { generateProxyKey } from "./src/keys.ts";
 // 配置常量
 // ================================
 const CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions";
+const CEREBRAS_PUBLIC_MODELS_URL = "https://api.cerebras.ai/public/v1/models";
 const KV_PREFIX = "cerebras-proxy";
 const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
+const MODEL_CATALOG_KEY = [KV_PREFIX, "meta", "model_catalog"] as const;
 const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
 const PROXY_KEY_PREFIX = [KV_PREFIX, "keys", "proxy"] as const;
 const ADMIN_PASSWORD_KEY = [KV_PREFIX, "meta", "admin_password"] as const;
@@ -19,6 +21,8 @@ const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 const UPSTREAM_TEST_TIMEOUT_MS = 12000;
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const MIN_KV_FLUSH_INTERVAL_MS = 1000;
+const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
+const MODEL_CATALOG_FETCH_TIMEOUT_MS = 8000;
 
 function normalizeKvFlushIntervalMs(ms: number): number {
   if (!Number.isFinite(ms)) return DEFAULT_KV_FLUSH_INTERVAL_MS;
@@ -161,6 +165,12 @@ interface ProxyConfig {
   schemaVersion: string;
 }
 
+interface ModelCatalog {
+  source: "cerebras-public";
+  fetchedAt: number;
+  models: string[];
+}
+
 const DEFAULT_MODEL_POOL = [
   "gpt-oss-120b",
   "qwen-3-235b-a22b-instruct-2507",
@@ -183,6 +193,9 @@ let flushInProgress = false;
 
 let cachedModelPool: string[] = [];
 let modelCursor = 0;
+
+let cachedModelCatalog: ModelCatalog | null = null;
+let modelCatalogFetchInFlight: Promise<ModelCatalog> | null = null;
 
 // 代理鉴权密钥缓存
 let cachedProxyKeys = new Map<string, ProxyAuthKey>();
@@ -531,6 +544,81 @@ async function kvUpdateConfig(
     }
   }
   throw new Error("配置更新失败：达到最大重试次数");
+}
+
+function isModelCatalogFresh(catalog: ModelCatalog, now: number): boolean {
+  return now >= catalog.fetchedAt &&
+    (now - catalog.fetchedAt) < MODEL_CATALOG_TTL_MS;
+}
+
+async function kvGetModelCatalog(): Promise<ModelCatalog | null> {
+  const entry = await kv.get<ModelCatalog>(MODEL_CATALOG_KEY);
+  return entry.value ?? null;
+}
+
+async function refreshModelCatalog(): Promise<ModelCatalog> {
+  if (modelCatalogFetchInFlight) {
+    return await modelCatalogFetchInFlight;
+  }
+
+  modelCatalogFetchInFlight = (async () => {
+    const response = await fetchWithTimeout(
+      CEREBRAS_PUBLIC_MODELS_URL,
+      {
+        method: "GET",
+        headers: { "Accept": "application/json" },
+      },
+      MODEL_CATALOG_FETCH_TIMEOUT_MS,
+    );
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      const suffix = text && text.length <= 200 ? `: ${text}` : "";
+      throw new Error(`模型目录拉取失败：HTTP ${response.status}${suffix}`);
+    }
+
+    const data = await response.json().catch(() => ({}));
+    const rawModels = (data as { data?: unknown })?.data;
+
+    const ids = Array.isArray(rawModels)
+      ? rawModels
+        .map((m) => {
+          if (!m || typeof m !== "object") return "";
+          if (!("id" in m)) return "";
+          const id = (m as { id?: unknown }).id;
+          return typeof id === "string" ? id.trim() : "";
+        })
+        .filter((id) => id.length > 0)
+      : [];
+
+    const seen = new Set<string>();
+    const models: string[] = [];
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      models.push(id);
+    }
+
+    const catalog: ModelCatalog = {
+      source: "cerebras-public",
+      fetchedAt: Date.now(),
+      models,
+    };
+
+    cachedModelCatalog = catalog;
+
+    try {
+      await kv.set(MODEL_CATALOG_KEY, catalog);
+    } catch (error) {
+      console.error(`[KV] model catalog save failed:`, error);
+    }
+
+    return catalog;
+  })().finally(() => {
+    modelCatalogFetchInFlight = null;
+  });
+
+  return await modelCatalogFetchInFlight;
 }
 
 async function kvGetAllKeys(): Promise<ApiKey[]> {
@@ -1035,6 +1123,79 @@ async function handler(req: Request): Promise<Response> {
         effectiveKvFlushIntervalMs: effective,
         kvFlushIntervalMinMs: MIN_KV_FLUSH_INTERVAL_MS,
       });
+    }
+
+    // ========== 模型目录（catalog） ==========
+    if (req.method === "GET" && path === "/api/models/catalog") {
+      const now = Date.now();
+
+      let catalog = cachedModelCatalog;
+      if (!catalog || !isModelCatalogFresh(catalog, now)) {
+        const kvCatalog = await kvGetModelCatalog();
+        if (kvCatalog) {
+          cachedModelCatalog = kvCatalog;
+          catalog = kvCatalog;
+        }
+      }
+
+      let stale = true;
+      let lastError: string | undefined;
+
+      if (catalog && isModelCatalogFresh(catalog, now)) {
+        stale = false;
+      } else {
+        try {
+          catalog = await refreshModelCatalog();
+          stale = false;
+        } catch (error) {
+          lastError = getErrorMessage(error);
+          stale = true;
+        }
+      }
+
+      if (!catalog) {
+        return problemResponse(lastError ?? "无法获取模型目录", {
+          status: 502,
+          instance: path,
+        });
+      }
+
+      return jsonResponse({
+        source: catalog.source,
+        fetchedAt: catalog.fetchedAt,
+        ttlMs: MODEL_CATALOG_TTL_MS,
+        stale,
+        ...(lastError ? { lastError } : {}),
+        models: catalog.models,
+      });
+    }
+
+    if (req.method === "POST" && path === "/api/models/catalog/refresh") {
+      let catalog = cachedModelCatalog ?? await kvGetModelCatalog();
+
+      try {
+        catalog = await refreshModelCatalog();
+        return jsonResponse({
+          source: catalog.source,
+          fetchedAt: catalog.fetchedAt,
+          ttlMs: MODEL_CATALOG_TTL_MS,
+          stale: false,
+          models: catalog.models,
+        });
+      } catch (error) {
+        const lastError = getErrorMessage(error);
+        if (!catalog) {
+          return problemResponse(lastError, { status: 502, instance: path });
+        }
+        return jsonResponse({
+          source: catalog.source,
+          fetchedAt: catalog.fetchedAt,
+          ttlMs: MODEL_CATALOG_TTL_MS,
+          stale: true,
+          lastError,
+          models: catalog.models,
+        });
+      }
     }
 
     // ========== 模型池管理 ==========

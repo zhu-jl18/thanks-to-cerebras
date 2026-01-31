@@ -1662,26 +1662,92 @@ async function handler(req: Request): Promise<Response> {
           badge.textContent = '公开访问';
         }
 
+        // Use DOM API to prevent XSS
+        container.innerHTML = '';
+
         if (data.keys?.length > 0) {
-          container.innerHTML = data.keys.map(k => \`
-            <div class="list-item">
-              <div class="item-info">
-                <div class="item-primary">
-                  <span class="key-text" id="pk-\${k.id}">\${k.key}</span>
-                  <button class="btn-icon" onclick="toggleProxyKeyVisibility('\${k.id}')" title="查看完整密钥">
-                    <svg id="pk-eye-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                    <svg id="pk-eye-off-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-                  </button>
-                </div>
-                <div class="item-secondary">\${k.name} · 已使用 \${k.useCount} 次</div>
-              </div>
-              <div class="item-actions">
-                <button class="btn btn-outline" onclick="copyProxyKey('\${k.id}')">复制</button>
-                <button class="btn btn-danger" onclick="deleteProxyKey('\${k.id}')">删除</button>
-              </div>
-            </div>\`).join('');
+          for (const k of data.keys) {
+            const listItem = document.createElement('div');
+            listItem.className = 'list-item';
+
+            const itemInfo = document.createElement('div');
+            itemInfo.className = 'item-info';
+
+            const itemPrimary = document.createElement('div');
+            itemPrimary.className = 'item-primary';
+
+            const keySpan = document.createElement('span');
+            keySpan.className = 'key-text';
+            keySpan.id = 'pk-' + k.id;
+            keySpan.textContent = k.key;
+
+            const toggleBtn = document.createElement('button');
+            toggleBtn.className = 'btn-icon';
+            toggleBtn.title = '查看完整密钥';
+
+            const eyeSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            eyeSvg.id = 'pk-eye-' + k.id;
+            eyeSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            eyeSvg.setAttribute('width', '12');
+            eyeSvg.setAttribute('height', '12');
+            eyeSvg.setAttribute('viewBox', '0 0 24 24');
+            eyeSvg.setAttribute('fill', 'none');
+            eyeSvg.setAttribute('stroke', 'currentColor');
+            eyeSvg.setAttribute('stroke-width', '2');
+            eyeSvg.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+
+            const eyeOffSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            eyeOffSvg.id = 'pk-eye-off-' + k.id;
+            eyeOffSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            eyeOffSvg.setAttribute('width', '12');
+            eyeOffSvg.setAttribute('height', '12');
+            eyeOffSvg.setAttribute('viewBox', '0 0 24 24');
+            eyeOffSvg.setAttribute('fill', 'none');
+            eyeOffSvg.setAttribute('stroke', 'currentColor');
+            eyeOffSvg.setAttribute('stroke-width', '2');
+            eyeOffSvg.style.display = 'none';
+            eyeOffSvg.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>';
+
+            toggleBtn.appendChild(eyeSvg);
+            toggleBtn.appendChild(eyeOffSvg);
+            toggleBtn.addEventListener('click', () => toggleProxyKeyVisibility(k.id));
+
+            itemPrimary.appendChild(keySpan);
+            itemPrimary.appendChild(toggleBtn);
+
+            const itemSecondary = document.createElement('div');
+            itemSecondary.className = 'item-secondary';
+            itemSecondary.textContent = k.name + ' · 已使用 ' + k.useCount + ' 次';
+
+            itemInfo.appendChild(itemPrimary);
+            itemInfo.appendChild(itemSecondary);
+
+            const itemActions = document.createElement('div');
+            itemActions.className = 'item-actions';
+
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'btn btn-outline';
+            copyBtn.textContent = '复制';
+            copyBtn.addEventListener('click', () => copyProxyKey(k.id));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = '删除';
+            deleteBtn.addEventListener('click', () => deleteProxyKey(k.id));
+
+            itemActions.appendChild(copyBtn);
+            itemActions.appendChild(deleteBtn);
+
+            listItem.appendChild(itemInfo);
+            listItem.appendChild(itemActions);
+
+            container.appendChild(listItem);
+          }
         } else {
-          container.innerHTML = '<div class="empty-state">暂无代理密钥，API 当前为公开访问</div>';
+          const emptyState = document.createElement('div');
+          emptyState.className = 'empty-state';
+          emptyState.textContent = '暂无代理密钥，API 当前为公开访问';
+          container.appendChild(emptyState);
         }
       } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
     }
@@ -1767,30 +1833,112 @@ async function handler(req: Request): Promise<Response> {
         const res = await fetch('/api/keys', { headers: getAuthHeaders() });
         const data = await res.json();
         const container = document.getElementById('keysContainer');
+
+        // Use DOM API to prevent XSS
+        container.innerHTML = '';
+
         if (data.keys?.length > 0) {
-          container.innerHTML = data.keys.map(k => \`
-            <div class="list-item">
-              <div class="item-info">
-                <div class="item-primary">
-                  <span class="key-text" id="key-\${k.id}">\${k.key}</span>
-                  <span class="key-actions">
-                    <button class="btn-icon" onclick="toggleKeyVisibility('\${k.id}')" title="查看完整密钥">
-                      <svg id="eye-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                      <svg id="eye-off-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-                    </button>
-                    <button class="btn-icon" onclick="copyKey('\${k.id}')" title="复制密钥">
-                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    </button>
-                  </span>
-                </div>
-                <div class="item-secondary"><span class="status-badge status-\${k.status}">\${k.status}</span> · 已使用 \${k.useCount} 次</div>
-              </div>
-              <div class="item-actions">
-                <button class="btn btn-success" onclick="testKey('\${k.id}', this)">测试</button>
-                <button class="btn btn-danger" onclick="deleteKey('\${k.id}')">删除</button>
-              </div>
-            </div>\`).join('');
-        } else container.innerHTML = '<div class="empty-state">暂无 API 密钥</div>';
+          for (const k of data.keys) {
+            const listItem = document.createElement('div');
+            listItem.className = 'list-item';
+
+            const itemInfo = document.createElement('div');
+            itemInfo.className = 'item-info';
+
+            const itemPrimary = document.createElement('div');
+            itemPrimary.className = 'item-primary';
+
+            const keySpan = document.createElement('span');
+            keySpan.className = 'key-text';
+            keySpan.id = 'key-' + k.id;
+            keySpan.textContent = k.key;
+
+            const keyActions = document.createElement('span');
+            keyActions.className = 'key-actions';
+
+            const toggleBtn = document.createElement('button');
+            toggleBtn.className = 'btn-icon';
+            toggleBtn.title = '查看完整密钥';
+
+            const eyeSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            eyeSvg.id = 'eye-' + k.id;
+            eyeSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            eyeSvg.setAttribute('width', '14');
+            eyeSvg.setAttribute('height', '14');
+            eyeSvg.setAttribute('viewBox', '0 0 24 24');
+            eyeSvg.setAttribute('fill', 'none');
+            eyeSvg.setAttribute('stroke', 'currentColor');
+            eyeSvg.setAttribute('stroke-width', '2');
+            eyeSvg.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+
+            const eyeOffSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            eyeOffSvg.id = 'eye-off-' + k.id;
+            eyeOffSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+            eyeOffSvg.setAttribute('width', '14');
+            eyeOffSvg.setAttribute('height', '14');
+            eyeOffSvg.setAttribute('viewBox', '0 0 24 24');
+            eyeOffSvg.setAttribute('fill', 'none');
+            eyeOffSvg.setAttribute('stroke', 'currentColor');
+            eyeOffSvg.setAttribute('stroke-width', '2');
+            eyeOffSvg.style.display = 'none';
+            eyeOffSvg.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>';
+
+            toggleBtn.appendChild(eyeSvg);
+            toggleBtn.appendChild(eyeOffSvg);
+            toggleBtn.addEventListener('click', () => toggleKeyVisibility(k.id));
+
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'btn-icon';
+            copyBtn.title = '复制密钥';
+            copyBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+            copyBtn.addEventListener('click', () => copyKey(k.id));
+
+            keyActions.appendChild(toggleBtn);
+            keyActions.appendChild(copyBtn);
+
+            itemPrimary.appendChild(keySpan);
+            itemPrimary.appendChild(keyActions);
+
+            const itemSecondary = document.createElement('div');
+            itemSecondary.className = 'item-secondary';
+
+            const statusBadge = document.createElement('span');
+            statusBadge.className = 'status-badge status-' + k.status;
+            statusBadge.textContent = k.status;
+
+            itemSecondary.appendChild(statusBadge);
+            itemSecondary.appendChild(document.createTextNode(' · 已使用 ' + k.useCount + ' 次'));
+
+            itemInfo.appendChild(itemPrimary);
+            itemInfo.appendChild(itemSecondary);
+
+            const itemActions = document.createElement('div');
+            itemActions.className = 'item-actions';
+
+            const testBtn = document.createElement('button');
+            testBtn.className = 'btn btn-success';
+            testBtn.textContent = '测试';
+            testBtn.addEventListener('click', (e) => testKey(k.id, e.target));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = '删除';
+            deleteBtn.addEventListener('click', () => deleteKey(k.id));
+
+            itemActions.appendChild(testBtn);
+            itemActions.appendChild(deleteBtn);
+
+            listItem.appendChild(itemInfo);
+            listItem.appendChild(itemActions);
+
+            container.appendChild(listItem);
+          }
+        } else {
+          const emptyState = document.createElement('div');
+          emptyState.className = 'empty-state';
+          emptyState.textContent = '暂无 API 密钥';
+          container.appendChild(emptyState);
+        }
       } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
     }
 
@@ -1874,16 +2022,51 @@ async function handler(req: Request): Promise<Response> {
         const res = await fetch('/api/models', { headers: getAuthHeaders() });
         const data = await res.json();
         const container = document.getElementById('modelsContainer');
+
+        // Use DOM API to prevent XSS
+        container.innerHTML = '';
+
         if (data.models?.length > 0) {
-          container.innerHTML = data.models.map(m => \`
-            <div class="list-item">
-              <div class="item-info"><div class="item-primary">\${m}</div></div>
-              <div class="item-actions">
-                <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}', this)">测试</button>
-                <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(m)}')">删除</button>
-              </div>
-            </div>\`).join('');
-        } else container.innerHTML = '<div class="empty-state">模型池为空，使用默认模型</div>';
+          for (const m of data.models) {
+            const listItem = document.createElement('div');
+            listItem.className = 'list-item';
+
+            const itemInfo = document.createElement('div');
+            itemInfo.className = 'item-info';
+
+            const itemPrimary = document.createElement('div');
+            itemPrimary.className = 'item-primary';
+            itemPrimary.textContent = m;
+
+            itemInfo.appendChild(itemPrimary);
+
+            const itemActions = document.createElement('div');
+            itemActions.className = 'item-actions';
+
+            const testBtn = document.createElement('button');
+            testBtn.className = 'btn btn-success';
+            testBtn.textContent = '测试';
+            testBtn.addEventListener('click', (e) => testModel(encodeURIComponent(m), e.target));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = '删除';
+            deleteBtn.addEventListener('click', () => deleteModel(encodeURIComponent(m)));
+
+            itemActions.appendChild(testBtn);
+            itemActions.appendChild(deleteBtn);
+
+            listItem.appendChild(itemInfo);
+            listItem.appendChild(itemActions);
+
+            container.appendChild(listItem);
+          }
+        } else {
+          const emptyState = document.createElement('div');
+          emptyState.className = 'empty-state';
+          emptyState.textContent = '模型池为空，使用默认模型';
+          container.appendChild(emptyState);
+        }
       } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
     }
 

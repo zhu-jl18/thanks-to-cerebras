@@ -25,13 +25,6 @@ function normalizeKvFlushIntervalMs(ms: number): number {
   return Math.max(MIN_KV_FLUSH_INTERVAL_MS, Math.trunc(ms));
 }
 
-const ENV_KV_FLUSH_INTERVAL_MS = (() => {
-  const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
-  if (!raw) return null;
-  const ms = Number.parseInt(raw, 10);
-  return Number.isFinite(ms) ? normalizeKvFlushIntervalMs(ms) : null;
-})();
-
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS, DELETE, PUT",
@@ -198,23 +191,14 @@ const dirtyProxyKeyIds = new Set<string>();
 
 let kvFlushTimerId: number | null = null;
 let kvFlushIntervalMsEffective = DEFAULT_KV_FLUSH_INTERVAL_MS;
-let kvFlushIntervalSource: "env" | "config" = "config";
 
-function resolveKvFlushInterval(
-  config: ProxyConfig | null,
-): { ms: number; source: "env" | "config" } {
-  if (ENV_KV_FLUSH_INTERVAL_MS !== null) {
-    return { ms: ENV_KV_FLUSH_INTERVAL_MS, source: "env" };
-  }
-
+function resolveKvFlushIntervalMs(config: ProxyConfig | null): number {
   const ms = config?.kvFlushIntervalMs ?? DEFAULT_KV_FLUSH_INTERVAL_MS;
-  return { ms: normalizeKvFlushIntervalMs(ms), source: "config" };
+  return normalizeKvFlushIntervalMs(ms);
 }
 
 function applyKvFlushInterval(config: ProxyConfig | null): void {
-  const resolved = resolveKvFlushInterval(config);
-  kvFlushIntervalSource = resolved.source;
-  kvFlushIntervalMsEffective = resolved.ms;
+  kvFlushIntervalMsEffective = resolveKvFlushIntervalMs(config);
 
   if (kvFlushTimerId !== null) {
     clearInterval(kvFlushTimerId);
@@ -1025,7 +1009,6 @@ async function handler(req: Request): Promise<Response> {
           success: true,
           kvFlushIntervalMs: normalized,
           effectiveKvFlushIntervalMs: kvFlushIntervalMsEffective,
-          kvFlushIntervalSource,
           kvFlushIntervalMinMs: MIN_KV_FLUSH_INTERVAL_MS,
         });
       } catch (error) {
@@ -1042,7 +1025,7 @@ async function handler(req: Request): Promise<Response> {
         config.kvFlushIntervalMs ?? DEFAULT_KV_FLUSH_INTERVAL_MS,
       );
 
-      const resolved = resolveKvFlushInterval({
+      const effective = resolveKvFlushIntervalMs({
         ...config,
         kvFlushIntervalMs: configured,
       });
@@ -1050,8 +1033,7 @@ async function handler(req: Request): Promise<Response> {
       return jsonResponse({
         ...config,
         kvFlushIntervalMs: configured,
-        effectiveKvFlushIntervalMs: resolved.ms,
-        kvFlushIntervalSource: resolved.source,
+        effectiveKvFlushIntervalMs: effective,
         kvFlushIntervalMinMs: MIN_KV_FLUSH_INTERVAL_MS,
       });
     }
@@ -1803,10 +1785,7 @@ async function handler(req: Request): Promise<Response> {
         const hint = document.getElementById('kvFlushIntervalHint');
         if (hint) {
           const effective = data.effectiveKvFlushIntervalMs ?? data.kvFlushIntervalMs;
-          const source = data.kvFlushIntervalSource
-            ? ('（生效来源：' + data.kvFlushIntervalSource + '）')
-            : '';
-          hint.textContent = '当前生效：' + String(effective ?? '') + 'ms ' + source;
+          hint.textContent = '当前生效：' + String(effective ?? '') + 'ms';
         }
       } catch (e) {
         showNotification('加载配置失败: ' + formatClientError(e), 'error');

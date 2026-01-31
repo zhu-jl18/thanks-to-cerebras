@@ -116,8 +116,7 @@
 - `GET /api/stats`
 - `GET /api/config`
   - 返回配置（包含 KV 刷盘相关字段：`kvFlushIntervalMs` /
-    `effectiveKvFlushIntervalMs` / `kvFlushIntervalSource` /
-    `kvFlushIntervalMinMs`）
+    `effectiveKvFlushIntervalMs` / `kvFlushIntervalMinMs`）
 - `PATCH /api/config`
   - 请求体：`{ "kvFlushIntervalMs": number }`
   - 用途：更新 KV 刷盘间隔（会被钳制到最小值）

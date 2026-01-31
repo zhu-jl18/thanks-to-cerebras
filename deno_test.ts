@@ -1,4 +1,8 @@
-import { assertEquals, assertMatch, assert } from "https://deno.land/std@0.208.0/assert/mod.ts";
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+} from "https://deno.land/std@0.208.0/assert/mod.ts";
 
 // 导入需要测试的函数（这里使用动态导入以避免副作用）
 const PBKDF2_ITERATIONS = 100000;
@@ -6,27 +10,30 @@ const PBKDF2_ITERATIONS = 100000;
 // ================================
 // 辅助函数（从 deno.ts 复制用于测试）
 // ================================
-async function hashPassword(password: string, salt?: Uint8Array): Promise<string> {
+async function hashPassword(
+  password: string,
+  salt?: Uint8Array,
+): Promise<string> {
   const actualSalt = salt ?? crypto.getRandomValues(new Uint8Array(16));
 
   const encoder = new TextEncoder();
   const passwordKey = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     encoder.encode(password),
-    'PBKDF2',
+    "PBKDF2",
     false,
-    ['deriveBits']
+    ["deriveBits"],
   );
 
   const derivedBits = await crypto.subtle.deriveBits(
     {
-      name: 'PBKDF2',
+      name: "PBKDF2",
       salt: actualSalt.buffer as ArrayBuffer,
       iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256'
+      hash: "SHA-256",
     },
     passwordKey,
-    32 * 8
+    32 * 8,
   );
 
   const derivedKey = new Uint8Array(derivedBits);
@@ -36,35 +43,41 @@ async function hashPassword(password: string, salt?: Uint8Array): Promise<string
   return `v1$pbkdf2$${PBKDF2_ITERATIONS}$${saltB64}$${keyB64}`;
 }
 
-async function verifyAdminPassword(password: string, stored: string): Promise<boolean> {
-  const parts = stored.split('$');
+async function verifyAdminPassword(
+  password: string,
+  stored: string,
+): Promise<boolean> {
+  const parts = stored.split("$");
 
-  if (parts.length === 5 && parts[0] === 'v1' && parts[1] === 'pbkdf2') {
+  if (parts.length === 5 && parts[0] === "v1" && parts[1] === "pbkdf2") {
     const iterations = Number.parseInt(parts[2], 10);
     const saltB64 = parts[3];
     const storedKeyB64 = parts[4];
 
-    const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
-    const storedKey = Uint8Array.from(atob(storedKeyB64), c => c.charCodeAt(0));
+    const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
+    const storedKey = Uint8Array.from(
+      atob(storedKeyB64),
+      (c) => c.charCodeAt(0),
+    );
 
     const encoder = new TextEncoder();
     const passwordKey = await crypto.subtle.importKey(
-      'raw',
+      "raw",
       encoder.encode(password),
-      'PBKDF2',
+      "PBKDF2",
       false,
-      ['deriveBits']
+      ["deriveBits"],
     );
 
     const derivedBits = await crypto.subtle.deriveBits(
       {
-        name: 'PBKDF2',
+        name: "PBKDF2",
         salt: salt.buffer as ArrayBuffer,
         iterations,
-        hash: 'SHA-256'
+        hash: "SHA-256",
       },
       passwordKey,
-      storedKey.length * 8
+      storedKey.length * 8,
     );
 
     const computedKey = new Uint8Array(derivedBits);
@@ -83,10 +96,10 @@ async function verifyAdminPassword(password: string, stored: string): Promise<bo
 function generateProxyKey(): string {
   const randomBytes = crypto.getRandomValues(new Uint8Array(24));
   const base64 = btoa(String.fromCharCode(...randomBytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-  return 'cpk_' + base64;
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+  return "cpk_" + base64;
 }
 
 // ================================
@@ -97,7 +110,7 @@ Deno.test("generateProxyKey - 格式和长度", () => {
   const key = generateProxyKey();
 
   // 检查前缀
-  assertEquals(key.startsWith('cpk_'), true, "密钥应以 cpk_ 开头");
+  assertEquals(key.startsWith("cpk_"), true, "密钥应以 cpk_ 开头");
 
   // 检查长度（cpk_ = 4 字符 + base64url 编码的 24 字节 = 32 字符，总共 36）
   assertEquals(key.length, 36, "密钥长度应为 36 字符");
@@ -122,11 +135,15 @@ Deno.test("hashPassword - 版本化格式", async () => {
   const hash = await hashPassword(password);
 
   // 检查格式：v1$pbkdf2$<iters>$<salt_b64>$<key_b64>
-  const parts = hash.split('$');
+  const parts = hash.split("$");
   assertEquals(parts.length, 5, "哈希应包含 5 个部分");
-  assertEquals(parts[0], 'v1', "版本应为 v1");
-  assertEquals(parts[1], 'pbkdf2', "算法应为 pbkdf2");
-  assertEquals(parts[2], String(PBKDF2_ITERATIONS), `迭代次数应为 ${PBKDF2_ITERATIONS}`);
+  assertEquals(parts[0], "v1", "版本应为 v1");
+  assertEquals(parts[1], "pbkdf2", "算法应为 pbkdf2");
+  assertEquals(
+    parts[2],
+    String(PBKDF2_ITERATIONS),
+    `迭代次数应为 ${PBKDF2_ITERATIONS}`,
+  );
 
   // 检查 salt 和 key 是否为有效 base64
   assert(parts[3].length > 0, "盐不应为空");

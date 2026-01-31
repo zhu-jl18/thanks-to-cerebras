@@ -4,7 +4,7 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 // ================================
 // 配置常量
 // ================================
-const CEREBRAS_API_URL = 'https://api.cerebras.ai/v1/chat/completions';
+const CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions";
 const KV_PREFIX = "cerebras-proxy";
 const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
 const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
@@ -26,9 +26,9 @@ const KV_FLUSH_INTERVAL_MS = (() => {
 })();
 
 const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, DELETE, PUT',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS, DELETE, PUT",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
 };
 
 const NO_CACHE_HEADERS = {
@@ -44,7 +44,9 @@ const isDenoDeployment = Boolean(Deno.env.get("DENO_DEPLOYMENT_ID"));
 const kv = await (() => {
   if (isDenoDeployment) return Deno.openKv();
   const kvDir = `${import.meta.dirname}/.deno-kv-local`;
-  try { Deno.mkdirSync(kvDir, { recursive: true }); } catch { /* exists */ }
+  try {
+    Deno.mkdirSync(kvDir, { recursive: true });
+  } catch { /* exists */ }
   return Deno.openKv(`${kvDir}/kv.sqlite3`);
 })();
 
@@ -56,7 +58,7 @@ interface ApiKey {
   key: string;
   useCount: number;
   lastUsed?: number;
-  status: 'active' | 'inactive' | 'invalid';
+  status: "active" | "inactive" | "invalid";
   createdAt: number;
 }
 
@@ -78,13 +80,13 @@ interface ProxyConfig {
 }
 
 const DEFAULT_MODEL_POOL = [
-  'gpt-oss-120b',
-  'qwen-3-235b-a22b-instruct-2507',
-  'zai-glm-4.6',
-  'zai-glm-4.7',
+  "gpt-oss-120b",
+  "qwen-3-235b-a22b-instruct-2507",
+  "zai-glm-4.6",
+  "zai-glm-4.7",
 ];
-const FALLBACK_MODEL = 'qwen-3-235b-a22b-instruct-2507';
-const EXTERNAL_MODEL_ID = 'cerebras-translator';
+const FALLBACK_MODEL = "qwen-3-235b-a22b-instruct-2507";
+const EXTERNAL_MODEL_ID = "cerebras-translator";
 
 // ================================
 // 运行时缓存
@@ -117,22 +119,23 @@ function generateProxyKey(): string {
   const randomBytes = crypto.getRandomValues(new Uint8Array(24));
   // base64url 编码：使用 - 和 _ 替代 + 和 /，移除 =
   const base64 = btoa(String.fromCharCode(...randomBytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-  return 'cpk_' + base64;
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+  return "cpk_" + base64;
 }
 
 function maskKey(key: string): string {
   if (key.length <= 8) return "*".repeat(key.length);
-  return key.substring(0, 4) + "*".repeat(key.length - 8) + key.substring(key.length - 4);
+  return key.substring(0, 4) + "*".repeat(key.length - 8) +
+    key.substring(key.length - 4);
 }
 
 function parseBatchInput(input: string): string[] {
   return input
     .split(/[\n,\s]+/)
-    .map(k => k.trim())
-    .filter(k => k.length > 0);
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
 }
 
 function getErrorMessage(error: unknown): string {
@@ -149,7 +152,11 @@ function isAbortError(error: unknown): boolean {
   return false;
 }
 
-async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
   const controller = new AbortController();
   const externalSignal = init.signal;
 
@@ -157,11 +164,16 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, tim
     if (externalSignal.aborted) {
       controller.abort();
     } else {
-      externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      externalSignal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      });
     }
   }
 
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(0, timeoutMs));
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    Math.max(0, timeoutMs),
+  );
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } finally {
@@ -170,7 +182,9 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, tim
 }
 
 // 代理 API 鉴权：无密钥则公开，有密钥则验证
-function isProxyAuthorized(req: Request): { authorized: boolean; keyId?: string } {
+function isProxyAuthorized(
+  req: Request,
+): { authorized: boolean; keyId?: string } {
   if (cachedProxyKeys.size === 0) {
     return { authorized: true };
   }
@@ -199,27 +213,30 @@ function recordProxyKeyUsage(keyId: string): void {
 }
 
 // 管理面板鉴权
-async function hashPassword(password: string, salt?: Uint8Array): Promise<string> {
+async function hashPassword(
+  password: string,
+  salt?: Uint8Array,
+): Promise<string> {
   const actualSalt = salt ?? crypto.getRandomValues(new Uint8Array(16));
 
   const encoder = new TextEncoder();
   const passwordKey = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     encoder.encode(password),
-    'PBKDF2',
+    "PBKDF2",
     false,
-    ['deriveBits']
+    ["deriveBits"],
   );
 
   const derivedBits = await crypto.subtle.deriveBits(
     {
-      name: 'PBKDF2',
+      name: "PBKDF2",
       salt: actualSalt.buffer as ArrayBuffer,
       iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256'
+      hash: "SHA-256",
     },
     passwordKey,
-    PBKDF2_KEY_LENGTH * 8
+    PBKDF2_KEY_LENGTH * 8,
   );
 
   const derivedKey = new Uint8Array(derivedBits);
@@ -244,37 +261,40 @@ async function verifyAdminPassword(password: string): Promise<boolean> {
   const stored = await getAdminPassword();
   if (!stored) return false;
 
-  const parts = stored.split('$');
+  const parts = stored.split("$");
 
   // 检查版本化格式：v1$pbkdf2$<iters>$<salt_b64>$<key_b64>
-  if (parts.length === 5 && parts[0] === 'v1' && parts[1] === 'pbkdf2') {
+  if (parts.length === 5 && parts[0] === "v1" && parts[1] === "pbkdf2") {
     const iterations = Number.parseInt(parts[2], 10);
     const saltB64 = parts[3];
     const storedKeyB64 = parts[4];
 
     // 解码 base64
-    const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
-    const storedKey = Uint8Array.from(atob(storedKeyB64), c => c.charCodeAt(0));
+    const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
+    const storedKey = Uint8Array.from(
+      atob(storedKeyB64),
+      (c) => c.charCodeAt(0),
+    );
 
     // 使用相同参数重新计算
     const encoder = new TextEncoder();
     const passwordKey = await crypto.subtle.importKey(
-      'raw',
+      "raw",
       encoder.encode(password),
-      'PBKDF2',
+      "PBKDF2",
       false,
-      ['deriveBits']
+      ["deriveBits"],
     );
 
     const derivedBits = await crypto.subtle.deriveBits(
       {
-        name: 'PBKDF2',
+        name: "PBKDF2",
         salt: salt.buffer as ArrayBuffer,
         iterations,
-        hash: 'SHA-256'
+        hash: "SHA-256",
       },
       passwordKey,
-      storedKey.length * 8
+      storedKey.length * 8,
     );
 
     const computedKey = new Uint8Array(derivedBits);
@@ -318,7 +338,9 @@ async function isAdminAuthorized(req: Request): Promise<boolean> {
 function rebuildActiveKeyIds(): void {
   const keys = Array.from(cachedKeysById.values());
   keys.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
-  cachedActiveKeyIds = keys.filter(k => k.status === 'active').map(k => k.id);
+  cachedActiveKeyIds = keys.filter((k) => k.status === "active").map((k) =>
+    k.id
+  );
   if (cachedActiveKeyIds.length === 0) {
     cachedCursor = 0;
     return;
@@ -336,7 +358,7 @@ function getNextApiKeyFast(now: number): { key: string; id: string } | null {
     if (cooldownUntil > now) continue;
 
     const keyEntry = cachedKeysById.get(id);
-    if (!keyEntry || keyEntry.status !== 'active') continue;
+    if (!keyEntry || keyEntry.status !== "active") continue;
 
     cachedCursor = (idx + 1) % cachedActiveKeyIds.length;
 
@@ -357,15 +379,17 @@ function getNextApiKeyFast(now: number): { key: string; id: string } | null {
 
 function markKeyCooldownFrom429(id: string, response: Response): void {
   const retryAfter = response.headers.get("retry-after")?.trim();
-  const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter) ? Number.parseInt(retryAfter, 10) * 1000 : 2000;
+  const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter)
+    ? Number.parseInt(retryAfter, 10) * 1000
+    : 2000;
   keyCooldownUntil.set(id, Date.now() + Math.max(0, retryAfterMs));
 }
 
 function markKeyInvalid(id: string): void {
   const keyEntry = cachedKeysById.get(id);
   if (!keyEntry) return;
-  if (keyEntry.status === 'invalid') return;
-  keyEntry.status = 'invalid';
+  if (keyEntry.status === "invalid") return;
+  keyEntry.status = "invalid";
   dirtyKeyIds.add(id);
   keyCooldownUntil.delete(id);
   rebuildActiveKeyIds();
@@ -388,9 +412,12 @@ function getNextModelFast(): string {
 }
 
 function rebuildModelPoolCache(): void {
-  if (cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0) {
+  if (
+    cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0
+  ) {
     cachedModelPool = [...cachedConfig.modelPool];
-    modelCursor = (cachedConfig.currentModelIndex ?? 0) % cachedModelPool.length;
+    modelCursor = (cachedConfig.currentModelIndex ?? 0) %
+      cachedModelPool.length;
   } else {
     cachedModelPool = [...DEFAULT_MODEL_POOL];
     modelCursor = 0;
@@ -407,7 +434,9 @@ async function flushDirtyToKv(): Promise<void> {
   }
 
   if (flushInProgress) return;
-  if (!dirtyConfig && dirtyKeyIds.size === 0 && dirtyProxyKeyIds.size === 0) return;
+  if (!dirtyConfig && dirtyKeyIds.size === 0 && dirtyProxyKeyIds.size === 0) {
+    return;
+  }
   if (!cachedConfig) return;
 
   flushInProgress = true;
@@ -447,12 +476,12 @@ async function flushDirtyToKv(): Promise<void> {
 async function bootstrapCache(): Promise<void> {
   cachedConfig = await kvGetConfig();
   const keys = await kvGetAllKeys();
-  cachedKeysById = new Map(keys.map(k => [k.id, k]));
+  cachedKeysById = new Map(keys.map((k) => [k.id, k]));
   rebuildActiveKeyIds();
   rebuildModelPoolCache();
 
   const proxyKeys = await kvGetAllProxyKeys();
-  cachedProxyKeys = new Map(proxyKeys.map(k => [k.id, k]));
+  cachedProxyKeys = new Map(proxyKeys.map((k) => [k.id, k]));
 }
 
 // ================================
@@ -467,7 +496,7 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
       currentModelIndex: 0,
       currentKeyIndex: 0,
       totalRequests: 0,
-      schemaVersion: '3.0'
+      schemaVersion: "3.0",
     };
     await kv.set(CONFIG_KEY, defaultConfig);
     entry = await kv.get<ProxyConfig>(CONFIG_KEY);
@@ -484,11 +513,14 @@ async function kvGetConfig(): Promise<ProxyConfig> {
   return entry.value;
 }
 
-async function kvUpdateConfig(updater: (config: ProxyConfig) => ProxyConfig | Promise<ProxyConfig>): Promise<ProxyConfig> {
+async function kvUpdateConfig(
+  updater: (config: ProxyConfig) => ProxyConfig | Promise<ProxyConfig>,
+): Promise<ProxyConfig> {
   for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
     const entry = await kvEnsureConfigEntry();
     const nextConfig = await updater(entry.value);
-    const result = await kv.atomic().check(entry).set(CONFIG_KEY, nextConfig).commit();
+    const result = await kv.atomic().check(entry).set(CONFIG_KEY, nextConfig)
+      .commit();
     if (result.ok) {
       cachedConfig = nextConfig;
       return nextConfig;
@@ -506,9 +538,11 @@ async function kvGetAllKeys(): Promise<ApiKey[]> {
   return keys;
 }
 
-async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; error?: string }> {
+async function kvAddKey(
+  key: string,
+): Promise<{ success: boolean; id?: string; error?: string }> {
   const allKeys = Array.from(cachedKeysById.values());
-  const existingKey = allKeys.find(k => k.key === key);
+  const existingKey = allKeys.find((k) => k.key === key);
   if (existingKey) {
     return { success: false, error: "密钥已存在" };
   }
@@ -518,7 +552,7 @@ async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; e
     id,
     key,
     useCount: 0,
-    status: 'active',
+    status: "active",
     createdAt: Date.now(),
   };
 
@@ -529,7 +563,9 @@ async function kvAddKey(key: string): Promise<{ success: boolean; id?: string; e
   return { success: true, id };
 }
 
-async function kvDeleteKey(id: string): Promise<{ success: boolean; error?: string }> {
+async function kvDeleteKey(
+  id: string,
+): Promise<{ success: boolean; error?: string }> {
   const key = [...API_KEY_PREFIX, id];
   const result = await kv.get(key);
   if (!result.value) {
@@ -544,7 +580,10 @@ async function kvDeleteKey(id: string): Promise<{ success: boolean; error?: stri
   return { success: true };
 }
 
-async function kvUpdateKey(id: string, updates: Partial<ApiKey>): Promise<void> {
+async function kvUpdateKey(
+  id: string,
+  updates: Partial<ApiKey>,
+): Promise<void> {
   const key = [...API_KEY_PREFIX, id];
   const existing = cachedKeysById.get(id) ?? (await kv.get<ApiKey>(key)).value;
   if (!existing) return;
@@ -564,9 +603,14 @@ async function kvGetAllProxyKeys(): Promise<ProxyAuthKey[]> {
   return keys;
 }
 
-async function kvAddProxyKey(name: string): Promise<{ success: boolean; id?: string; key?: string; error?: string }> {
+async function kvAddProxyKey(
+  name: string,
+): Promise<{ success: boolean; id?: string; key?: string; error?: string }> {
   if (cachedProxyKeys.size >= MAX_PROXY_KEYS) {
-    return { success: false, error: `最多只能创建 ${MAX_PROXY_KEYS} 个代理密钥` };
+    return {
+      success: false,
+      error: `最多只能创建 ${MAX_PROXY_KEYS} 个代理密钥`,
+    };
   }
 
   const id = generateId();
@@ -585,7 +629,9 @@ async function kvAddProxyKey(name: string): Promise<{ success: boolean; id?: str
   return { success: true, id, key };
 }
 
-async function kvDeleteProxyKey(id: string): Promise<{ success: boolean; error?: string }> {
+async function kvDeleteProxyKey(
+  id: string,
+): Promise<{ success: boolean; error?: string }> {
   const key = [...PROXY_KEY_PREFIX, id];
   if (!cachedProxyKeys.has(id)) {
     return { success: false, error: "密钥不存在" };
@@ -600,41 +646,52 @@ async function kvDeleteProxyKey(id: string): Promise<{ success: boolean; error?:
 // ================================
 // API 密钥测试
 // ================================
-async function testKey(id: string): Promise<{ success: boolean; status: string; error?: string }> {
+async function testKey(
+  id: string,
+): Promise<{ success: boolean; status: string; error?: string }> {
   const apiKey = cachedKeysById.get(id);
 
   if (!apiKey) {
-    return { success: false, status: 'invalid', error: "密钥不存在" };
+    return { success: false, status: "invalid", error: "密钥不存在" };
   }
 
-  const testModel = cachedModelPool.length > 0 ? cachedModelPool[0] : FALLBACK_MODEL;
+  const testModel = cachedModelPool.length > 0
+    ? cachedModelPool[0]
+    : FALLBACK_MODEL;
 
   try {
     const response = await fetchWithTimeout(CEREBRAS_API_URL, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey.key}`,
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey.key}`,
       },
       body: JSON.stringify({
         model: testModel,
-        messages: [{ role: 'user', content: 'test' }],
+        messages: [{ role: "user", content: "test" }],
         max_tokens: 1,
       }),
     }, UPSTREAM_TEST_TIMEOUT_MS);
 
     if (response.ok) {
-      await kvUpdateKey(id, { status: 'active' });
-      return { success: true, status: 'active' };
+      await kvUpdateKey(id, { status: "active" });
+      return { success: true, status: "active" };
     } else {
-      const nextStatus: ApiKey['status'] = (response.status === 401 || response.status === 403) ? 'invalid' : 'inactive';
+      const nextStatus: ApiKey["status"] =
+        (response.status === 401 || response.status === 403)
+          ? "invalid"
+          : "inactive";
       await kvUpdateKey(id, { status: nextStatus });
-      return { success: false, status: nextStatus, error: `HTTP ${response.status}` };
+      return {
+        success: false,
+        status: nextStatus,
+        error: `HTTP ${response.status}`,
+      };
     }
   } catch (error) {
     const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
-    await kvUpdateKey(id, { status: 'inactive' });
-    return { success: false, status: 'inactive', error: msg };
+    await kvUpdateKey(id, { status: "inactive" });
+    return { success: false, status: "inactive", error: msg };
   }
 }
 
@@ -645,22 +702,26 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  if (req.method === 'OPTIONS') {
+  if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
   // 鉴权 API（无需登录）
-  if (path.startsWith('/api/auth/')) {
-    if (req.method === 'GET' && path === '/api/auth/status') {
+  if (path.startsWith("/api/auth/")) {
+    if (req.method === "GET" && path === "/api/auth/status") {
       const hasPassword = await getAdminPassword() !== null;
       const token = req.headers.get("X-Admin-Token");
       const isLoggedIn = await verifyAdminToken(token);
       return new Response(JSON.stringify({ hasPassword, isLoggedIn }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'POST' && path === '/api/auth/setup') {
+    if (req.method === "POST" && path === "/api/auth/setup") {
       const hasPassword = await getAdminPassword() !== null;
       if (hasPassword) {
         return new Response(JSON.stringify({ error: "密码已设置" }), {
@@ -689,7 +750,7 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'POST' && path === '/api/auth/login') {
+    if (req.method === "POST" && path === "/api/auth/login") {
       try {
         const { password } = await req.json();
         const valid = await verifyAdminPassword(password);
@@ -711,7 +772,7 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'POST' && path === '/api/auth/logout') {
+    if (req.method === "POST" && path === "/api/auth/logout") {
       const token = req.headers.get("X-Admin-Token");
       if (token) {
         await kv.delete([...ADMIN_TOKEN_PREFIX, token]);
@@ -728,7 +789,7 @@ async function handler(req: Request): Promise<Response> {
   }
 
   // 受保护的管理 API
-  if (path.startsWith('/api/')) {
+  if (path.startsWith("/api/")) {
     if (!await isAdminAuthorized(req)) {
       return new Response(JSON.stringify({ error: "未登录" }), {
         status: 401,
@@ -737,9 +798,9 @@ async function handler(req: Request): Promise<Response> {
     }
 
     // ========== 代理鉴权密钥管理 ==========
-    if (req.method === 'GET' && path === '/api/proxy-keys') {
+    if (req.method === "GET" && path === "/api/proxy-keys") {
       const keys = Array.from(cachedProxyKeys.values());
-      const masked = keys.map(k => ({
+      const masked = keys.map((k) => ({
         id: k.id,
         key: maskKey(k.key),
         name: k.name,
@@ -747,18 +808,25 @@ async function handler(req: Request): Promise<Response> {
         lastUsed: k.lastUsed,
         createdAt: k.createdAt,
       }));
-      return new Response(JSON.stringify({
-        keys: masked,
-        maxKeys: MAX_PROXY_KEYS,
-        authEnabled: cachedProxyKeys.size > 0
-      }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          keys: masked,
+          maxKeys: MAX_PROXY_KEYS,
+          authEnabled: cachedProxyKeys.size > 0,
+        }),
+        {
+          headers: {
+            ...CORS_HEADERS,
+            ...NO_CACHE_HEADERS,
+            "Content-Type": "application/json",
+          },
+        },
+      );
     }
 
-    if (req.method === 'POST' && path === '/api/proxy-keys') {
+    if (req.method === "POST" && path === "/api/proxy-keys") {
       try {
-        const { name } = await req.json().catch(() => ({ name: '' }));
+        const { name } = await req.json().catch(() => ({ name: "" }));
         const result = await kvAddProxyKey(name);
         return new Response(JSON.stringify(result), {
           status: result.success ? 201 : 400,
@@ -772,8 +840,8 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'DELETE' && path.startsWith('/api/proxy-keys/')) {
-      const id = path.split('/').pop()!;
+    if (req.method === "DELETE" && path.startsWith("/api/proxy-keys/")) {
+      const id = path.split("/").pop()!;
       const result = await kvDeleteProxyKey(id);
       return new Response(JSON.stringify(result), {
         status: result.success ? 200 : 400,
@@ -781,8 +849,11 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    if (req.method === 'GET' && path.startsWith('/api/proxy-keys/') && path.endsWith('/export')) {
-      const id = path.split('/')[3];
+    if (
+      req.method === "GET" && path.startsWith("/api/proxy-keys/") &&
+      path.endsWith("/export")
+    ) {
+      const id = path.split("/")[3];
       const pk = cachedProxyKeys.get(id);
       if (!pk) {
         return new Response(JSON.stringify({ error: "密钥不存在" }), {
@@ -791,23 +862,31 @@ async function handler(req: Request): Promise<Response> {
         });
       }
       return new Response(JSON.stringify({ key: pk.key }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
     // ========== Cerebras API 密钥管理 ==========
-    if (req.method === 'GET' && path === '/api/keys') {
+    if (req.method === "GET" && path === "/api/keys") {
       const keys = await kvGetAllKeys();
-      const maskedKeys = keys.map(k => ({
+      const maskedKeys = keys.map((k) => ({
         ...k,
         key: maskKey(k.key),
       }));
       return new Response(JSON.stringify({ keys: maskedKeys }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'POST' && path === '/api/keys') {
+    if (req.method === "POST" && path === "/api/keys") {
       try {
         const { key } = await req.json();
         if (!key) {
@@ -830,14 +909,14 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'POST' && path === '/api/keys/batch') {
+    if (req.method === "POST" && path === "/api/keys/batch") {
       try {
-        const contentType = req.headers.get('Content-Type') || '';
+        const contentType = req.headers.get("Content-Type") || "";
         let input: string;
 
-        if (contentType.includes('application/json')) {
+        if (contentType.includes("application/json")) {
           const body = await req.json();
-          input = body.input || (typeof body === 'string' ? body : '');
+          input = body.input || (typeof body === "string" ? body : "");
         } else {
           input = await req.text();
         }
@@ -860,20 +939,26 @@ async function handler(req: Request): Promise<Response> {
           if (result.success) {
             results.success.push(maskKey(key));
           } else {
-            results.failed.push({ key: maskKey(key), error: result.error || "未知错误" });
+            results.failed.push({
+              key: maskKey(key),
+              error: result.error || "未知错误",
+            });
           }
         }
 
-        return new Response(JSON.stringify({
-          summary: {
-            total: keys.length,
-            success: results.success.length,
-            failed: results.failed.length,
+        return new Response(
+          JSON.stringify({
+            summary: {
+              total: keys.length,
+              success: results.success.length,
+              failed: results.failed.length,
+            },
+            results,
+          }),
+          {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
           },
-          results,
-        }), {
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        );
       } catch (error) {
         return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
           status: 400,
@@ -882,16 +967,23 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'GET' && path === '/api/keys/export') {
+    if (req.method === "GET" && path === "/api/keys/export") {
       const keys = Array.from(cachedKeysById.values());
-      const rawKeys = keys.map(k => k.key);
+      const rawKeys = keys.map((k) => k.key);
       return new Response(JSON.stringify({ keys: rawKeys }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'GET' && path.startsWith('/api/keys/') && path.endsWith('/export')) {
-      const id = path.split('/')[3];
+    if (
+      req.method === "GET" && path.startsWith("/api/keys/") &&
+      path.endsWith("/export")
+    ) {
+      const id = path.split("/")[3];
       const keyEntry = cachedKeysById.get(id);
       if (!keyEntry) {
         return new Response(JSON.stringify({ error: "密钥不存在" }), {
@@ -900,12 +992,16 @@ async function handler(req: Request): Promise<Response> {
         });
       }
       return new Response(JSON.stringify({ key: keyEntry.key }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'DELETE' && path.startsWith('/api/keys/')) {
-      const id = path.split('/').pop()!;
+    if (req.method === "DELETE" && path.startsWith("/api/keys/")) {
+      const id = path.split("/").pop()!;
       const result = await kvDeleteKey(id);
       return new Response(JSON.stringify(result), {
         status: result.success ? 200 : 400,
@@ -913,8 +1009,11 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    if (req.method === 'POST' && path.startsWith('/api/keys/') && path.endsWith('/test')) {
-      const id = path.split('/')[3];
+    if (
+      req.method === "POST" && path.startsWith("/api/keys/") &&
+      path.endsWith("/test")
+    ) {
+      const id = path.split("/")[3];
       const result = await testKey(id);
       return new Response(JSON.stringify(result), {
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
@@ -922,13 +1021,13 @@ async function handler(req: Request): Promise<Response> {
     }
 
     // ========== 统计和配置 ==========
-    if (req.method === 'GET' && path === '/api/stats') {
+    if (req.method === "GET" && path === "/api/stats") {
       const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
       const stats = {
         totalKeys: keys.length,
-        activeKeys: keys.filter(k => k.status === 'active').length,
+        activeKeys: keys.filter((k) => k.status === "active").length,
         totalRequests: config.totalRequests,
-        keyUsage: keys.map(k => ({
+        keyUsage: keys.map((k) => ({
           id: k.id,
           maskedKey: maskKey(k.key),
           useCount: k.useCount,
@@ -936,27 +1035,41 @@ async function handler(req: Request): Promise<Response> {
         })),
       };
       return new Response(JSON.stringify(stats), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'GET' && path === '/api/config') {
+    if (req.method === "GET" && path === "/api/config") {
       const config = await kvGetConfig();
       return new Response(JSON.stringify(config), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
     // ========== 模型池管理 ==========
-    if (req.method === 'GET' && path === '/api/models') {
+    if (req.method === "GET" && path === "/api/models") {
       const config = await kvGetConfig();
-      const models = config.modelPool?.length > 0 ? config.modelPool : DEFAULT_MODEL_POOL;
+      const models = config.modelPool?.length > 0
+        ? config.modelPool
+        : DEFAULT_MODEL_POOL;
       return new Response(JSON.stringify({ models }), {
-        headers: { ...CORS_HEADERS, ...NO_CACHE_HEADERS, "Content-Type": "application/json" },
+        headers: {
+          ...CORS_HEADERS,
+          ...NO_CACHE_HEADERS,
+          "Content-Type": "application/json",
+        },
       });
     }
 
-    if (req.method === 'POST' && path === '/api/models') {
+    if (req.method === "POST" && path === "/api/models") {
       try {
         const { model } = await req.json();
         if (!model?.trim()) {
@@ -974,16 +1087,19 @@ async function handler(req: Request): Promise<Response> {
           });
         }
 
-        await kvUpdateConfig(config => ({
+        await kvUpdateConfig((config) => ({
           ...config,
-          modelPool: [...config.modelPool, trimmedModel]
+          modelPool: [...config.modelPool, trimmedModel],
         }));
         rebuildModelPoolCache();
 
-        return new Response(JSON.stringify({ success: true, model: trimmedModel }), {
-          status: 201,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ success: true, model: trimmedModel }),
+          {
+            status: 201,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          },
+        );
       } catch (error) {
         return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
           status: 400,
@@ -992,8 +1108,8 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    if (req.method === 'DELETE' && path.startsWith('/api/models/')) {
-      const encodedName = path.substring('/api/models/'.length);
+    if (req.method === "DELETE" && path.startsWith("/api/models/")) {
+      const encodedName = path.substring("/api/models/".length);
       const modelName = decodeURIComponent(encodedName);
 
       if (!cachedModelPool.includes(modelName)) {
@@ -1003,10 +1119,10 @@ async function handler(req: Request): Promise<Response> {
         });
       }
 
-      await kvUpdateConfig(config => ({
+      await kvUpdateConfig((config) => ({
         ...config,
-        modelPool: config.modelPool.filter(m => m !== modelName),
-        currentModelIndex: 0
+        modelPool: config.modelPool.filter((m) => m !== modelName),
+        currentModelIndex: 0,
       }));
       rebuildModelPoolCache();
 
@@ -1015,50 +1131,71 @@ async function handler(req: Request): Promise<Response> {
       });
     }
 
-    if (req.method === 'POST' && path.startsWith('/api/models/') && path.endsWith('/test')) {
-      const parts = path.split('/');
+    if (
+      req.method === "POST" && path.startsWith("/api/models/") &&
+      path.endsWith("/test")
+    ) {
+      const parts = path.split("/");
       const encodedName = parts[3];
       const modelName = decodeURIComponent(encodedName);
 
-      const activeKey = Array.from(cachedKeysById.values()).find(k => k.status === 'active');
+      const activeKey = Array.from(cachedKeysById.values()).find((k) =>
+        k.status === "active"
+      );
       if (!activeKey) {
-        return new Response(JSON.stringify({ success: false, error: "没有可用的 API 密钥" }), {
-          status: 400,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ success: false, error: "没有可用的 API 密钥" }),
+          {
+            status: 400,
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          },
+        );
       }
 
       try {
         const response = await fetchWithTimeout(CEREBRAS_API_URL, {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${activeKey.key}`,
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${activeKey.key}`,
           },
           body: JSON.stringify({
             model: modelName,
-            messages: [{ role: 'user', content: 'test' }],
+            messages: [{ role: "user", content: "test" }],
             max_tokens: 1,
           }),
         }, UPSTREAM_TEST_TIMEOUT_MS);
 
         if (response.ok) {
-          return new Response(JSON.stringify({ success: true, status: 'available' }), {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return new Response(
+            JSON.stringify({ success: true, status: "available" }),
+            {
+              headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+            },
+          );
         } else {
           if (response.status === 401 || response.status === 403) {
-            await kvUpdateKey(activeKey.id, { status: 'invalid' });
+            await kvUpdateKey(activeKey.id, { status: "invalid" });
           }
-          return new Response(JSON.stringify({ success: false, status: 'unavailable', error: `HTTP ${response.status}` }), {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
+          return new Response(
+            JSON.stringify({
+              success: false,
+              status: "unavailable",
+              error: `HTTP ${response.status}`,
+            }),
+            {
+              headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+            },
+          );
         }
       } catch (error) {
         const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
-        return new Response(JSON.stringify({ success: false, status: 'error', error: msg }), {
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ success: false, status: "error", error: msg }),
+          {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          },
+        );
       }
     }
 
@@ -1069,23 +1206,26 @@ async function handler(req: Request): Promise<Response> {
   }
 
   // GET /v1/models - OpenAI 兼容
-  if (req.method === 'GET' && path === '/v1/models') {
+  if (req.method === "GET" && path === "/v1/models") {
     const now = Math.floor(Date.now() / 1000);
-    return new Response(JSON.stringify({
-      object: "list",
-      data: [{
-        id: EXTERNAL_MODEL_ID,
-        object: "model",
-        created: now,
-        owned_by: "cerebras",
-      }]
-    }), {
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        object: "list",
+        data: [{
+          id: EXTERNAL_MODEL_ID,
+          object: "model",
+          created: now,
+          owned_by: "cerebras",
+        }],
+      }),
+      {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      },
+    );
   }
 
   // POST /v1/chat/completions - 代理转发
-  if (req.method === 'POST' && path === '/v1/chat/completions') {
+  if (req.method === "POST" && path === "/v1/chat/completions") {
     const authResult = isProxyAuthorized(req);
     if (!authResult.authorized) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -1106,25 +1246,33 @@ async function handler(req: Request): Promise<Response> {
       const apiKeyData = getNextApiKeyFast(Date.now());
       if (!apiKeyData) {
         const now = Date.now();
-        const cooldowns = cachedActiveKeyIds.map(id => keyCooldownUntil.get(id) ?? 0).filter(ms => ms > now);
-        const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
-        const retryAfterSeconds = minCooldownUntil > now ? Math.ceil((minCooldownUntil - now) / 1000) : 0;
+        const cooldowns = cachedActiveKeyIds.map((id) =>
+          keyCooldownUntil.get(id) ?? 0
+        ).filter((ms) => ms > now);
+        const minCooldownUntil = cooldowns.length > 0
+          ? Math.min(...cooldowns)
+          : 0;
+        const retryAfterSeconds = minCooldownUntil > now
+          ? Math.ceil((minCooldownUntil - now) / 1000)
+          : 0;
 
         return new Response(JSON.stringify({ error: "没有可用的 API 密钥" }), {
           status: cachedActiveKeyIds.length > 0 ? 429 : 500,
           headers: {
             ...CORS_HEADERS,
             "Content-Type": "application/json",
-            ...(retryAfterSeconds > 0 ? { "Retry-After": String(retryAfterSeconds) } : {}),
+            ...(retryAfterSeconds > 0
+              ? { "Retry-After": String(retryAfterSeconds) }
+              : {}),
           },
         });
       }
 
       const apiResponse = await fetch(CEREBRAS_API_URL, {
-        method: 'POST',
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKeyData.key}`,
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKeyData.key}`,
         },
         body: JSON.stringify(requestBody),
       });
@@ -1146,7 +1294,6 @@ async function handler(req: Request): Promise<Response> {
         statusText: apiResponse.statusText,
         headers: responseHeaders,
       });
-
     } catch (error) {
       return new Response(JSON.stringify({ error: getErrorMessage(error) }), {
         status: 400,
@@ -1156,20 +1303,22 @@ async function handler(req: Request): Promise<Response> {
   }
 
   // 主页
-  if (path === '/' && req.method === 'GET') {
+  if (path === "/" && req.method === "GET") {
     const [keys, config] = await Promise.all([kvGetAllKeys(), kvGetConfig()]);
     const proxyKeyCount = cachedProxyKeys.size;
     const stats = {
       totalKeys: keys.length,
-      activeKeys: keys.filter(k => k.status === 'active').length,
+      activeKeys: keys.filter((k) => k.status === "active").length,
       totalRequests: config.totalRequests,
       proxyAuthEnabled: proxyKeyCount > 0,
       proxyKeyCount,
     };
 
-    const faviconDataUri = `data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzA2YjZkNCIgZD0iTTIyIDRoLTkuNzdMMTEgLjM0YS41LjUgMCAwIDAtLjUtLjM0SDJhMiAyIDAgMCAwLTIgMnYxNmEyIDIgMCAwIDAgMiAyaDkuNjVMMTMgMjMuNjhhLjUuNSAwIDAgMCAuNDcuMzJIMjJhMiAyIDAgMCAwIDItMlY2YTIgMiAwIDAgMC0yLTJaTTcuNSAxNWE0LjUgNC41IDAgMSAxIDIuOTItNy45Mi41LjUgMCAxIDEtLjY1Ljc2QTMuNSAzLjUgMCAxIDAgMTEgMTFINy41YS41LjUgMCAwIDEgMC0xaDRhLjUuNSAwIDAgMSAuNS41QTQuNSA0LjUgMCAwIDEgNy41IDE1Wm0xMS45LTRhMTEuMjYgMTEuMjYgMCAwIDEtMS44NiAzLjI5IDYuNjcgNi42NyAwIDAgMS0xLjA3LTEuNDguNS41IDAgMCAwLS45My4zOCA4IDggMCAwIDAgMS4zNCAxLjg3IDguOSA4LjkgMCAwIDEtLjY1LjYyTDE0LjYyIDExWk0yMyAyMmExIDEgMCAwIDEtMSAxaC03LjRsMi43Ny0zLjE3YS40OS40OSAwIDAgMCAuMDktLjQ4bC0uOTEtMi42NmE5LjM2IDkuMzYgMCAwIDAgMS0uODljMSAxIDEuOTMgMS45MSAyLjEyIDIuMDhhLjUuNSAwIDAgMCAuNjgtLjc0IDQzLjQ4IDQzLjQ4IDAgMCAxLTIuMTMtMi4xIDExLjQ5IDExLjQ5IDAgMCAwIDIuMjItNGgxLjA2YS41LjUgMCAwIDAgMC0xSDE4VjkuNWEuNS41IDAgMCAwLTEgMHYuNWgtMi41YS40OS40OSAwIDAgMC0uMjEgMGwtMS43Mi01SDIyYTEgMSAwIDAgMSAxIDFaIi8+PC9zdmc+`;
+    const faviconDataUri =
+      `data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzA2YjZkNCIgZD0iTTIyIDRoLTkuNzdMMTEgLjM0YS41LjUgMCAwIDAtLjUtLjM0SDJhMiAyIDAgMCAwLTIgMnYxNmEyIDIgMCAwIDAgMiAyaDkuNjVMMTMgMjMuNjhhLjUuNSAwIDAgMCAuNDcuMzJIMjJhMiAyIDAgMCAwIDItMlY2YTIgMiAwIDAgMC0yLTJaTTcuNSAxNWE0LjUgNC41IDAgMSAxIDIuOTItNy45Mi41LjUgMCAxIDEtLjY1Ljc2QTMuNSAzLjUgMCAxIDAgMTEgMTFINy41YS41LjUgMCAwIDEgMC0xaDRhLjUuNSAwIDAgMSAuNS41QTQuNSA0LjUgMCAwIDEgNy41IDE1Wm0xMS45LTRhMTEuMjYgMTEuMjYgMCAwIDEtMS44NiAzLjI5IDYuNjcgNi42NyAwIDAgMS0xLjA3LTEuNDguNS41IDAgMCAwLS45My4zOCA4IDggMCAwIDAgMS4zNCAxLjg3IDguOSA4LjkgMCAwIDEtLjY1LjYyTDE0LjYyIDExWk0yMyAyMmExIDEgMCAwIDEtMSAxaC03LjRsMi43Ny0zLjE3YS40OS40OSAwIDAgMCAuMDktLjQ4bC0uOTEtMi42NmE5LjM2IDkuMzYgMCAwIDAgMS0uODljMSAxIDEuOTMgMS45MSAyLjEyIDIuMDhhLjUuNSAwIDAgMCAuNjgtLjc0IDQzLjQ4IDQzLjQ4IDAgMCAxLTIuMTMtMi4xIDExLjQ5IDExLjQ5IDAgMCAwIDIuMjItNGgxLjA2YS41LjUgMCAwIDAgMC0xSDE4VjkuNWEuNS41IDAgMCAwLTEgMHYuNWgtMi41YS40OS40OSAwIDAgMC0uMjEgMGwtMS43Mi01SDIyYTEgMSAwIDAgMSAxIDFaIi8+PC9zdmc+`;
 
-    return new Response(`<!DOCTYPE html>
+    return new Response(
+      `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -1436,7 +1585,9 @@ async function handler(req: Request): Promise<Response> {
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
           <div>
             <span class="section-title" style="margin: 0;">代理访问密钥</span>
-            <span id="authBadge" class="auth-badge ${stats.proxyAuthEnabled ? 'auth-on' : 'auth-off'}">${stats.proxyAuthEnabled ? '鉴权已开启' : '公开访问'}</span>
+            <span id="authBadge" class="auth-badge ${
+        stats.proxyAuthEnabled ? "auth-on" : "auth-off"
+      }">${stats.proxyAuthEnabled ? "鉴权已开启" : "公开访问"}</span>
           </div>
           <span style="font-size: 11px; color: #64748b;" id="keyCountLabel">${stats.proxyKeyCount}/${MAX_PROXY_KEYS}</span>
         </div>
@@ -1930,9 +2081,11 @@ async function handler(req: Request): Promise<Response> {
     checkAuth();
   </script>
 </body>
-</html>`, {
-      headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/html" },
-    });
+</html>`,
+      {
+        headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/html" },
+      },
+    );
   }
 
   return new Response("Not Found", { status: 404 });

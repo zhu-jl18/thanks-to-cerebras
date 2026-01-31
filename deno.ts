@@ -2242,15 +2242,51 @@ async function handler(req: Request): Promise<Response> {
         const data = await res.json();
         const container = document.getElementById('modelsContainer');
         if (data.models?.length > 0) {
-          container.innerHTML = data.models.map(m => \`
-            <div class="list-item">
-              <div class="item-info"><div class="item-primary">\${m}</div></div>
-              <div class="item-actions">
-                <button class="btn btn-success" onclick="testModel('\${encodeURIComponent(m)}', this)">测试</button>
-                <button class="btn btn-danger" onclick="deleteModel('\${encodeURIComponent(m)}')">删除</button>
-              </div>
-            </div>\`).join('');
-        } else container.innerHTML = '<div class="empty-state">模型池为空，使用默认模型</div>';
+          container.textContent = '';
+
+          for (const m of data.models) {
+            const item = document.createElement('div');
+            item.className = 'list-item';
+
+            const info = document.createElement('div');
+            info.className = 'item-info';
+
+            const primary = document.createElement('div');
+            primary.className = 'item-primary';
+            primary.textContent = String(m ?? '');
+
+            info.appendChild(primary);
+
+            const actions = document.createElement('div');
+            actions.className = 'item-actions';
+
+            const encodedName = encodeURIComponent(m);
+
+            const testBtn = document.createElement('button');
+            testBtn.className = 'btn btn-success';
+            testBtn.textContent = '测试';
+            testBtn.addEventListener('click', () => testModel(encodedName, testBtn));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = '删除';
+            deleteBtn.addEventListener('click', () => deleteModel(encodedName));
+
+            actions.appendChild(testBtn);
+            actions.appendChild(deleteBtn);
+
+            item.appendChild(info);
+            item.appendChild(actions);
+
+            container.appendChild(item);
+          }
+        } else {
+          container.textContent = '';
+          const empty = document.createElement('div');
+          empty.className = 'empty-state';
+          empty.textContent = '模型池为空，使用默认模型';
+          container.appendChild(empty);
+        }
       } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
     }
 

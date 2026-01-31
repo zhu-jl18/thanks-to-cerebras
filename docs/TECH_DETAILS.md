@@ -18,7 +18,7 @@ Client -> /v1/chat/completions -> Deno Proxy -> Cerebras API
 代理访问密钥存储在 KV，逻辑如下：
 
 ```typescript
-async function isProxyAuthorized(req: Request) {
+function isProxyAuthorized(req: Request) {
   // 无代理密钥 -> 公开访问
   if (cachedProxyKeys.size === 0) return { authorized: true };
 
@@ -33,7 +33,7 @@ async function isProxyAuthorized(req: Request) {
 
 ## 模型池轮询
 
-- 对外暴露虚拟模型名 `cerebras-proxy`
+- 对外暴露虚拟模型名 `cerebras-translator`（见 `GET /v1/models`）
 - 内部按 Round-Robin 选择真实模型
 - 轮询游标持久化到 KV
 
@@ -49,7 +49,7 @@ async function isProxyAuthorized(req: Request) {
 }
 
 // 管理员密码
-[KV_PREFIX, "meta", "admin_password"] -> string (SHA256 hash)
+[KV_PREFIX, "meta", "admin_password"] -> string (PBKDF2 hash, v1$pbkdf2$...)
 
 // Cerebras API 密钥
 [KV_PREFIX, "keys", "api", <id>] -> ApiKey {
@@ -77,4 +77,4 @@ async function isProxyAuthorized(req: Request) {
 
 ## 本地运行
 
-本地运行时 KV 自动存储在 `./kv.sqlite3`（通过检测 `DENO_DEPLOYMENT_ID` 判断环境）。
+本地运行时 KV 自动存储在 `.deno-kv-local/kv.sqlite3`（通过检测 `DENO_DEPLOYMENT_ID` 判断环境）。

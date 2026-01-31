@@ -91,7 +91,7 @@
 </div>
 
 
-详细部署步骤与运维说明请查看 [部署指南](GUIDE.md)。
+详细部署步骤与运维说明请查看 [部署指南](docs/GUIDE.md)。
 
 
 
@@ -118,7 +118,7 @@ sequenceDiagram
     DP-->>IT: 流式透传
 ```
 
-实现细节与成本说明请查看 [技术细节](TECH_DETAILS.md)。
+实现细节与成本说明请查看 [技术细节](docs/TECH_DETAILS.md)。
 
 ## Development
 

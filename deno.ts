@@ -2008,29 +2008,156 @@ async function handler(req: Request): Promise<Response> {
         const data = await res.json();
         const container = document.getElementById('keysContainer');
         if (data.keys?.length > 0) {
-          container.innerHTML = data.keys.map(k => \`
-            <div class="list-item">
-              <div class="item-info">
-                <div class="item-primary">
-                  <span class="key-text" id="key-\${k.id}">\${k.key}</span>
-                  <span class="key-actions">
-                    <button class="btn-icon" onclick="toggleKeyVisibility('\${k.id}')" title="查看完整密钥">
-                      <svg id="eye-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                      <svg id="eye-off-\${k.id}" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-                    </button>
-                    <button class="btn-icon" onclick="copyKey('\${k.id}')" title="复制密钥">
-                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    </button>
-                  </span>
-                </div>
-                <div class="item-secondary"><span class="status-badge status-\${k.status}">\${k.status}</span> · 已使用 \${k.useCount} 次</div>
-              </div>
-              <div class="item-actions">
-                <button class="btn btn-success" onclick="testKey('\${k.id}', this)">测试</button>
-                <button class="btn btn-danger" onclick="deleteKey('\${k.id}')">删除</button>
-              </div>
-            </div>\`).join('');
-        } else container.innerHTML = '<div class="empty-state">暂无 API 密钥</div>';
+          container.textContent = '';
+
+          for (const k of data.keys) {
+            const item = document.createElement('div');
+            item.className = 'list-item';
+
+            const info = document.createElement('div');
+            info.className = 'item-info';
+
+            const primary = document.createElement('div');
+            primary.className = 'item-primary';
+
+            const keySpan = document.createElement('span');
+            keySpan.className = 'key-text';
+            keySpan.id = 'key-' + k.id;
+            keySpan.textContent = String(k.key ?? '');
+
+            const keyActions = document.createElement('span');
+            keyActions.className = 'key-actions';
+
+            const svgNs = 'http://www.w3.org/2000/svg';
+
+            const toggleBtn = document.createElement('button');
+            toggleBtn.className = 'btn-icon';
+            toggleBtn.title = '查看完整密钥';
+            toggleBtn.addEventListener('click', () => toggleKeyVisibility(k.id));
+
+            const eyeIcon = document.createElementNS(svgNs, 'svg');
+            eyeIcon.id = 'eye-' + k.id;
+            eyeIcon.setAttribute('xmlns', svgNs);
+            eyeIcon.setAttribute('width', '14');
+            eyeIcon.setAttribute('height', '14');
+            eyeIcon.setAttribute('viewBox', '0 0 24 24');
+            eyeIcon.setAttribute('fill', 'none');
+            eyeIcon.setAttribute('stroke', 'currentColor');
+            eyeIcon.setAttribute('stroke-width', '2');
+
+            const eyePath = document.createElementNS(svgNs, 'path');
+            eyePath.setAttribute('d', 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z');
+
+            const eyeCircle = document.createElementNS(svgNs, 'circle');
+            eyeCircle.setAttribute('cx', '12');
+            eyeCircle.setAttribute('cy', '12');
+            eyeCircle.setAttribute('r', '3');
+
+            eyeIcon.appendChild(eyePath);
+            eyeIcon.appendChild(eyeCircle);
+
+            const eyeOffIcon = document.createElementNS(svgNs, 'svg');
+            eyeOffIcon.id = 'eye-off-' + k.id;
+            eyeOffIcon.setAttribute('xmlns', svgNs);
+            eyeOffIcon.setAttribute('width', '14');
+            eyeOffIcon.setAttribute('height', '14');
+            eyeOffIcon.setAttribute('viewBox', '0 0 24 24');
+            eyeOffIcon.setAttribute('fill', 'none');
+            eyeOffIcon.setAttribute('stroke', 'currentColor');
+            eyeOffIcon.setAttribute('stroke-width', '2');
+            eyeOffIcon.style.display = 'none';
+
+            const eyeOffPath = document.createElementNS(svgNs, 'path');
+            eyeOffPath.setAttribute('d', 'M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24');
+
+            const eyeOffLine = document.createElementNS(svgNs, 'line');
+            eyeOffLine.setAttribute('x1', '1');
+            eyeOffLine.setAttribute('y1', '1');
+            eyeOffLine.setAttribute('x2', '23');
+            eyeOffLine.setAttribute('y2', '23');
+
+            eyeOffIcon.appendChild(eyeOffPath);
+            eyeOffIcon.appendChild(eyeOffLine);
+
+            toggleBtn.appendChild(eyeIcon);
+            toggleBtn.appendChild(eyeOffIcon);
+
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'btn-icon';
+            copyBtn.title = '复制密钥';
+            copyBtn.addEventListener('click', () => copyKey(k.id));
+
+            const copySvg = document.createElementNS(svgNs, 'svg');
+            copySvg.setAttribute('xmlns', svgNs);
+            copySvg.setAttribute('width', '14');
+            copySvg.setAttribute('height', '14');
+            copySvg.setAttribute('viewBox', '0 0 24 24');
+            copySvg.setAttribute('fill', 'none');
+            copySvg.setAttribute('stroke', 'currentColor');
+            copySvg.setAttribute('stroke-width', '2');
+
+            const copyRect = document.createElementNS(svgNs, 'rect');
+            copyRect.setAttribute('x', '9');
+            copyRect.setAttribute('y', '9');
+            copyRect.setAttribute('width', '13');
+            copyRect.setAttribute('height', '13');
+            copyRect.setAttribute('rx', '2');
+            copyRect.setAttribute('ry', '2');
+
+            const copyPath = document.createElementNS(svgNs, 'path');
+            copyPath.setAttribute('d', 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1');
+
+            copySvg.appendChild(copyRect);
+            copySvg.appendChild(copyPath);
+            copyBtn.appendChild(copySvg);
+
+            keyActions.appendChild(toggleBtn);
+            keyActions.appendChild(copyBtn);
+
+            primary.appendChild(keySpan);
+            primary.appendChild(keyActions);
+
+            const secondary = document.createElement('div');
+            secondary.className = 'item-secondary';
+
+            const statusBadge = document.createElement('span');
+            statusBadge.className = 'status-badge status-' + String(k.status ?? '');
+            statusBadge.textContent = String(k.status ?? '');
+
+            secondary.appendChild(statusBadge);
+            secondary.appendChild(document.createTextNode(' · 已使用 ' + String(k.useCount ?? 0) + ' 次'));
+
+            info.appendChild(primary);
+            info.appendChild(secondary);
+
+            const actions = document.createElement('div');
+            actions.className = 'item-actions';
+
+            const testBtn = document.createElement('button');
+            testBtn.className = 'btn btn-success';
+            testBtn.textContent = '测试';
+            testBtn.addEventListener('click', () => testKey(k.id, testBtn));
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = '删除';
+            deleteBtn.addEventListener('click', () => deleteKey(k.id));
+
+            actions.appendChild(testBtn);
+            actions.appendChild(deleteBtn);
+
+            item.appendChild(info);
+            item.appendChild(actions);
+
+            container.appendChild(item);
+          }
+        } else {
+          container.textContent = '';
+          const empty = document.createElement('div');
+          empty.className = 'empty-state';
+          empty.textContent = '暂无 API 密钥';
+          container.appendChild(empty);
+        }
       } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
     }
 

@@ -1207,6 +1207,50 @@ async function handler(req: Request): Promise<Response> {
       return jsonResponse({ models });
     }
 
+    if (req.method === "PUT" && path === "/api/models") {
+      try {
+        const body = await req.json().catch(() => ({}));
+        const raw = (body as { models?: unknown }).models;
+        if (!Array.isArray(raw)) {
+          return problemResponse("models 必须为字符串数组", {
+            status: 400,
+            instance: path,
+          });
+        }
+
+        const seen = new Set<string>();
+        const models = raw
+          .map((m) => (typeof m === "string" ? m.trim() : ""))
+          .filter((m) => m.length > 0)
+          .filter((m) => {
+            if (seen.has(m)) return false;
+            seen.add(m);
+            return true;
+          });
+
+        if (models.length === 0) {
+          return problemResponse("模型池不能为空", {
+            status: 400,
+            instance: path,
+          });
+        }
+
+        await kvUpdateConfig((config) => ({
+          ...config,
+          modelPool: models,
+          currentModelIndex: 0,
+        }));
+        rebuildModelPoolCache();
+
+        return jsonResponse({ success: true, models });
+      } catch (error) {
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
+      }
+    }
+
     if (req.method === "POST" && path === "/api/models") {
       try {
         const { model } = await req.json();
@@ -1665,14 +1709,28 @@ async function handler(req: Request): Promise<Response> {
       <div id="modelsTab" class="tab-content">
         <p class="hint" style="margin-top: 0; margin-bottom: 14px;">模型池轮询，分散 TPM 负载</p>
 
+        <div class="section-title">可用模型目录</div>
         <div class="form-group">
-          <label>添加模型</label>
+          <label>搜索</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="modelCatalogSearch" class="form-control" placeholder="搜索模型（例如 qwen / llama / glm）" style="flex: 1;">
+            <button class="btn btn-outline" onclick="refreshModelCatalog()" id="refreshModelCatalogBtn">刷新</button>
+          </div>
+          <p class="hint" id="modelCatalogHint">加载中...</p>
+        </div>
+
+        <div id="modelCatalogContainer"></div>
+        <button class="btn" onclick="saveModelPoolFromSelection()" style="margin-top: 8px;" id="saveModelPoolBtn">保存模型池</button>
+
+        <div class="divider"></div>
+        <div class="form-group">
+          <label>高级：手动添加自定义模型</label>
           <input type="text" id="newModel" class="form-control" placeholder="例如 llama-3.3-70b">
           <button class="btn" onclick="addModel()" style="margin-top: 8px;">添加</button>
         </div>
 
         <div class="divider"></div>
-        <div class="section-title">模型列表</div>
+        <div class="section-title">当前模型池</div>
         <div id="modelsContainer"></div>
       </div>
 
@@ -1740,6 +1798,9 @@ async function handler(req: Request): Promise<Response> {
     let authMode = 'login';
     const MAX_PROXY_KEYS = ${MAX_PROXY_KEYS};
 
+    let currentModelPool = [];
+    let modelCatalogState = null;
+
     // 主题管理
     function loadTheme() {
       const saved = localStorage.getItem('theme') || 'light';
@@ -1802,6 +1863,7 @@ async function handler(req: Request): Promise<Response> {
           document.getElementById('authOverlay').style.display = 'none';
           loadProxyKeys();
           loadKeys();
+          loadModelCatalog();
           loadModels();
           loadConfig();
         }
@@ -2484,6 +2546,188 @@ async function handler(req: Request): Promise<Response> {
     }
 
     // 模型管理
+    function formatTimestamp(ms) {
+      try { return new Date(ms).toLocaleString(); } catch { return String(ms); }
+    }
+
+    function renderModelCatalog() {
+      const container = document.getElementById('modelCatalogContainer');
+      const hint = document.getElementById('modelCatalogHint');
+      if (!container || !hint) return;
+
+      const pool = Array.isArray(currentModelPool) ? currentModelPool.map(m => String(m)) : [];
+      const poolSet = new Set(pool);
+
+      const catalogModels = (modelCatalogState && Array.isArray(modelCatalogState.models))
+        ? modelCatalogState.models.map(m => String(m))
+        : [];
+      const catalogSet = new Set(catalogModels);
+
+      const searchEl = document.getElementById('modelCatalogSearch');
+      const q = (searchEl && 'value' in searchEl ? String(searchEl.value || '') : '').trim().toLowerCase();
+
+      container.textContent = '';
+
+      if (!modelCatalogState) {
+        hint.textContent = '未加载模型目录';
+      } else {
+        const fetchedAt = modelCatalogState.fetchedAt ? formatTimestamp(modelCatalogState.fetchedAt) : '';
+        const stale = modelCatalogState.stale ? '；目录可能过时' : '';
+        const lastError = modelCatalogState.lastError ? ('；上次错误：' + modelCatalogState.lastError) : '';
+        hint.textContent = '目录模型数：' + String(catalogModels.length) + (fetchedAt ? ('；更新时间：' + fetchedAt) : '') + stale + lastError;
+      }
+
+      function addCheckboxRow(model, badgeText) {
+        const name = String(model || '').trim();
+        if (!name) return;
+        if (q && !name.toLowerCase().includes(q)) return;
+
+        const item = document.createElement('div');
+        item.className = 'list-item';
+
+        const info = document.createElement('div');
+        info.className = 'item-info';
+
+        const primary = document.createElement('div');
+        primary.className = 'item-primary';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'model-pool-checkbox';
+        checkbox.dataset.model = name;
+        checkbox.checked = poolSet.has(name);
+        checkbox.style.marginRight = '8px';
+
+        const modelSpan = document.createElement('span');
+        modelSpan.className = 'key-text';
+        modelSpan.textContent = name;
+
+        primary.appendChild(checkbox);
+        primary.appendChild(modelSpan);
+
+        if (badgeText) {
+          const badge = document.createElement('span');
+          badge.className = 'status-badge status-inactive';
+          badge.textContent = badgeText;
+          primary.appendChild(badge);
+        }
+
+        info.appendChild(primary);
+        item.appendChild(info);
+        container.appendChild(item);
+      }
+
+      const extras = pool.filter((m) => !catalogSet.has(m));
+      if (extras.length > 0) {
+        const title = document.createElement('div');
+        title.className = 'section-title';
+        title.textContent = '自定义/不在目录';
+        container.appendChild(title);
+        for (const m of extras) addCheckboxRow(m, '自定义');
+
+        const divider = document.createElement('div');
+        divider.className = 'divider';
+        container.appendChild(divider);
+      }
+
+      const title = document.createElement('div');
+      title.className = 'section-title';
+      title.textContent = '目录模型';
+      container.appendChild(title);
+
+      if (catalogModels.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = '目录为空（可能是网络问题或上游变更）';
+        container.appendChild(empty);
+        return;
+      }
+
+      for (const m of catalogModels) {
+        addCheckboxRow(m, '');
+      }
+    }
+
+    async function loadModelCatalog() {
+      try {
+        const res = await fetch('/api/models/catalog', { headers: getAuthHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('加载模型目录失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+        modelCatalogState = data;
+        renderModelCatalog();
+      } catch (e) {
+        showNotification('加载模型目录失败: ' + formatClientError(e), 'error');
+      }
+    }
+
+    async function refreshModelCatalog() {
+      const btn = document.getElementById('refreshModelCatalogBtn');
+      setButtonLoading(btn, true, '刷新中...');
+      try {
+        const { res, data } = await fetchJsonWithTimeout('/api/models/catalog/refresh', { method: 'POST', headers: getAuthHeaders() }, 15000);
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('刷新失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+        modelCatalogState = data;
+        showNotification('目录已刷新');
+        renderModelCatalog();
+      } catch (e) {
+        showNotification('刷新失败: ' + formatClientError(e), 'error');
+      } finally {
+        setButtonLoading(btn, false);
+      }
+    }
+
+    async function saveModelPoolFromSelection() {
+      const btn = document.getElementById('saveModelPoolBtn');
+      setButtonLoading(btn, true, '保存中...');
+
+      try {
+        const nodes = document.querySelectorAll('.model-pool-checkbox');
+        const models = [];
+        const seen = new Set();
+
+        for (const el of nodes) {
+          if (!el || el.type !== 'checkbox') continue;
+          if (!el.checked) continue;
+          const m = String(el.dataset.model || '').trim();
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          models.push(m);
+        }
+
+        if (models.length === 0) {
+          showNotification('模型池不能为空', 'error');
+          return;
+        }
+
+        const res = await fetch('/api/models', {
+          method: 'PUT',
+          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ models }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '保存失败', 'error');
+          return;
+        }
+
+        showNotification('模型池已保存');
+        loadModels();
+      } catch (e) {
+        showNotification('保存失败: ' + formatClientError(e), 'error');
+      } finally {
+        setButtonLoading(btn, false);
+      }
+    }
+
     async function loadModels() {
       try {
         const res = await fetch('/api/models', { headers: getAuthHeaders() });
@@ -2493,6 +2737,8 @@ async function handler(req: Request): Promise<Response> {
           showNotification('加载失败: ' + getApiErrorMessage(res, data), 'error');
           return;
         }
+
+        currentModelPool = Array.isArray(data.models) ? data.models.map(m => String(m)) : [];
 
         const container = document.getElementById('modelsContainer');
         if (data.models?.length > 0) {
@@ -2538,10 +2784,14 @@ async function handler(req: Request): Promise<Response> {
           container.textContent = '';
           const empty = document.createElement('div');
           empty.className = 'empty-state';
-          empty.textContent = '模型池为空，使用默认模型';
+          empty.textContent = '模型池为空（将使用默认模型）';
           container.appendChild(empty);
         }
-      } catch (e) { showNotification('加载失败: ' + formatClientError(e), 'error'); }
+
+        renderModelCatalog();
+      } catch (e) {
+        showNotification('加载失败: ' + formatClientError(e), 'error');
+      }
     }
 
     async function addModel() {
@@ -2593,6 +2843,11 @@ async function handler(req: Request): Promise<Response> {
       } finally {
         setButtonLoading(btn, false);
       }
+    }
+
+    const modelSearch = document.getElementById('modelCatalogSearch');
+    if (modelSearch) {
+      modelSearch.addEventListener('input', () => renderModelCatalog());
     }
 
     checkAuth();

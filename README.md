@@ -69,7 +69,8 @@
      * `dist/deno.bundle.min.js`（推荐，体积更小）：https://github.com/zhu-jl18/thanks-to-cerebras/blob/bundle/dist/deno.bundle.min.js
      * `dist/deno.bundle.js`（可读版本）：https://github.com/zhu-jl18/thanks-to-cerebras/blob/bundle/dist/deno.bundle.js
    * **开发者版**：直接把 `deno.ts` 的代码粘贴进去并部署（或使用 GitHub 绑定部署）。
-   * (Optional) 配置环境变量`KV_FLUSH_INTERVAL_MS=<刷盘间隔ms>`，默认 15000。
+   * (Optional) 配置环境变量`KV_FLUSH_INTERVAL_MS=<刷盘间隔ms>`（默认 15000；最小 1000；会覆盖面板配置）。
+   * 也可以在管理面板「访问控制」→「高级设置」里修改刷盘间隔。
     <div align="center">
       <p>Deno Deploy 配置</p>
       <img src="image/配置说明1.png" alt="Deno Deploy" width="70%">

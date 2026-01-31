@@ -67,6 +67,58 @@ function jsonError(
   return jsonResponse({ error: message }, { status, headers });
 }
 
+function problemTitle(status: number): string {
+  if (status >= 500) return "服务器错误";
+
+  switch (status) {
+    case 400:
+      return "请求错误";
+    case 401:
+      return "未授权";
+    case 403:
+      return "禁止访问";
+    case 404:
+      return "未找到";
+    case 409:
+      return "冲突";
+    case 429:
+      return "请求过多";
+    default:
+      return "请求失败";
+  }
+}
+
+function problemResponse(
+  detail: string,
+  options: {
+    status?: number;
+    title?: string;
+    type?: string;
+    instance?: string;
+    headers?: HeadersInit;
+  } = {},
+): Response {
+  const status = options.status ?? 400;
+  const headers = new Headers({ "Content-Type": "application/problem+json" });
+
+  if (options.headers) {
+    new Headers(options.headers).forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+
+  return jsonResponse(
+    {
+      type: options.type ?? "about:blank",
+      title: options.title ?? problemTitle(status),
+      status,
+      detail,
+      ...(options.instance ? { instance: options.instance } : {}),
+    },
+    { status, headers },
+  );
+}
+
 // ================================
 // Deno KV 存储
 // ================================
@@ -652,18 +704,24 @@ async function handler(req: Request): Promise<Response> {
     if (req.method === "POST" && path === "/api/auth/setup") {
       const hasPassword = await getAdminPassword() !== null;
       if (hasPassword) {
-        return jsonResponse({ error: "密码已设置" }, { status: 400 });
+        return problemResponse("密码已设置", { status: 400, instance: path });
       }
       try {
         const { password } = await req.json();
         if (!password || password.length < 4) {
-          return jsonResponse({ error: "密码至少 4 位" }, { status: 400 });
+          return problemResponse("密码至少 4 位", {
+            status: 400,
+            instance: path,
+          });
         }
         await setAdminPassword(password);
         const token = await createAdminToken();
         return jsonResponse({ success: true, token });
       } catch (error) {
-        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
@@ -672,12 +730,15 @@ async function handler(req: Request): Promise<Response> {
         const { password } = await req.json();
         const valid = await verifyAdminPassword(password);
         if (!valid) {
-          return jsonResponse({ error: "密码错误" }, { status: 401 });
+          return problemResponse("密码错误", { status: 401, instance: path });
         }
         const token = await createAdminToken();
         return jsonResponse({ success: true, token });
       } catch (error) {
-        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
@@ -689,13 +750,13 @@ async function handler(req: Request): Promise<Response> {
       return jsonResponse({ success: true });
     }
 
-    return jsonResponse({ error: "Not Found" }, { status: 404 });
+    return problemResponse("Not Found", { status: 404, instance: path });
   }
 
   // 受保护的管理 API
   if (path.startsWith("/api/")) {
     if (!await isAdminAuthorized(req)) {
-      return jsonResponse({ error: "未登录" }, { status: 401 });
+      return problemResponse("未登录", { status: 401, instance: path });
     }
 
     // ========== 代理鉴权密钥管理 ==========
@@ -720,16 +781,31 @@ async function handler(req: Request): Promise<Response> {
       try {
         const { name } = await req.json().catch(() => ({ name: "" }));
         const result = await kvAddProxyKey(name);
-        return jsonResponse(result, { status: result.success ? 201 : 400 });
+        if (!result.success) {
+          return problemResponse(result.error ?? "创建失败", {
+            status: 400,
+            instance: path,
+          });
+        }
+        return jsonResponse(result, { status: 201 });
       } catch (error) {
-        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
     if (req.method === "DELETE" && path.startsWith("/api/proxy-keys/")) {
       const id = path.split("/").pop()!;
       const result = await kvDeleteProxyKey(id);
-      return jsonResponse(result, { status: result.success ? 200 : 400 });
+      if (!result.success) {
+        return problemResponse(result.error ?? "删除失败", {
+          status: result.error === "密钥不存在" ? 404 : 400,
+          instance: path,
+        });
+      }
+      return jsonResponse(result);
     }
 
     if (
@@ -739,7 +815,7 @@ async function handler(req: Request): Promise<Response> {
       const id = path.split("/")[3];
       const pk = cachedProxyKeys.get(id);
       if (!pk) {
-        return jsonResponse({ error: "密钥不存在" }, { status: 404 });
+        return problemResponse("密钥不存在", { status: 404, instance: path });
       }
       return jsonResponse({ key: pk.key });
     }
@@ -758,13 +834,26 @@ async function handler(req: Request): Promise<Response> {
       try {
         const { key } = await req.json();
         if (!key) {
-          return jsonResponse({ error: "密钥不能为空" }, { status: 400 });
+          return problemResponse("密钥不能为空", {
+            status: 400,
+            instance: path,
+          });
         }
 
         const result = await kvAddKey(key);
-        return jsonResponse(result, { status: result.success ? 201 : 400 });
+        if (!result.success) {
+          return problemResponse(result.error ?? "添加失败", {
+            status: result.error === "密钥已存在" ? 409 : 400,
+            instance: path,
+          });
+        }
+
+        return jsonResponse(result, { status: 201 });
       } catch (error) {
-        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
@@ -781,7 +870,10 @@ async function handler(req: Request): Promise<Response> {
         }
 
         if (!input?.trim()) {
-          return jsonResponse({ error: "输入不能为空" }, { status: 400 });
+          return problemResponse("输入不能为空", {
+            status: 400,
+            instance: path,
+          });
         }
 
         const keys = parseBatchInput(input);
@@ -811,7 +903,10 @@ async function handler(req: Request): Promise<Response> {
           results,
         });
       } catch (error) {
-        return jsonResponse({ error: getErrorMessage(error) }, { status: 400 });
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
@@ -828,7 +923,7 @@ async function handler(req: Request): Promise<Response> {
       const id = path.split("/")[3];
       const keyEntry = cachedKeysById.get(id);
       if (!keyEntry) {
-        return jsonError("密钥不存在", 404);
+        return problemResponse("密钥不存在", { status: 404, instance: path });
       }
       return jsonResponse({ key: keyEntry.key });
     }
@@ -836,7 +931,13 @@ async function handler(req: Request): Promise<Response> {
     if (req.method === "DELETE" && path.startsWith("/api/keys/")) {
       const id = path.split("/").pop()!;
       const result = await kvDeleteKey(id);
-      return jsonResponse(result, { status: result.success ? 200 : 400 });
+      if (!result.success) {
+        return problemResponse(result.error ?? "删除失败", {
+          status: result.error === "密钥不存在" ? 404 : 400,
+          instance: path,
+        });
+      }
+      return jsonResponse(result);
     }
 
     if (
@@ -883,12 +984,15 @@ async function handler(req: Request): Promise<Response> {
       try {
         const { model } = await req.json();
         if (!model?.trim()) {
-          return jsonError("模型名称不能为空");
+          return problemResponse("模型名称不能为空", {
+            status: 400,
+            instance: path,
+          });
         }
 
         const trimmedModel = model.trim();
         if (cachedModelPool.includes(trimmedModel)) {
-          return jsonError("模型已存在");
+          return problemResponse("模型已存在", { status: 409, instance: path });
         }
 
         await kvUpdateConfig((config) => ({
@@ -902,7 +1006,10 @@ async function handler(req: Request): Promise<Response> {
           { status: 201 },
         );
       } catch (error) {
-        return jsonError(getErrorMessage(error));
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
       }
     }
 
@@ -911,7 +1018,7 @@ async function handler(req: Request): Promise<Response> {
       const modelName = decodeURIComponent(encodedName);
 
       if (!cachedModelPool.includes(modelName)) {
-        return jsonError("模型不存在", 404);
+        return problemResponse("模型不存在", { status: 404, instance: path });
       }
 
       await kvUpdateConfig((config) => ({
@@ -936,10 +1043,10 @@ async function handler(req: Request): Promise<Response> {
         k.status === "active"
       );
       if (!activeKey) {
-        return jsonResponse(
-          { success: false, error: "没有可用的 API 密钥" },
-          { status: 400 },
-        );
+        return problemResponse("没有可用的 API 密钥", {
+          status: 400,
+          instance: path,
+        });
       }
 
       try {
@@ -974,7 +1081,7 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
-    return jsonError("Not Found", 404);
+    return problemResponse("Not Found", { status: 404, instance: path });
   }
 
   // GET /v1/models - OpenAI 兼容
@@ -1436,7 +1543,11 @@ async function handler(req: Request): Promise<Response> {
     async function checkAuth() {
       try {
         const res = await fetch('/api/auth/status', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showAuthError(getApiErrorMessage(res, data));
+          return;
+        }
         if (!data.hasPassword) {
           authMode = 'setup';
           document.getElementById('authTitle').textContent = '首次使用，请设置管理密码';
@@ -1475,17 +1586,25 @@ async function handler(req: Request): Promise<Response> {
         if (password !== confirm) { showAuthError('两次密码不一致'); return; }
         try {
           const res = await fetch('/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            showAuthError(getApiErrorMessage(res, data) || '设置失败');
+            return;
+          }
           if (data.success && data.token) { adminToken = data.token; localStorage.setItem('adminToken', adminToken); checkAuth(); }
-          else showAuthError(data.error || '设置失败');
-        } catch (e) { showAuthError('错误: ' + e.message); }
+          else showAuthError('设置失败');
+        } catch (e) { showAuthError('错误: ' + formatClientError(e)); }
       } else {
         try {
           const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            showAuthError(getApiErrorMessage(res, data) || '登录失败');
+            return;
+          }
           if (data.success && data.token) { adminToken = data.token; localStorage.setItem('adminToken', adminToken); checkAuth(); }
-          else showAuthError(data.error || '登录失败');
-        } catch (e) { showAuthError('错误: ' + e.message); }
+          else showAuthError('登录失败');
+        } catch (e) { showAuthError('错误: ' + formatClientError(e)); }
       }
     }
 
@@ -1540,6 +1659,22 @@ async function handler(req: Request): Promise<Response> {
       }
     }
 
+    function getApiErrorMessage(res, data) {
+      if (data && typeof data.detail === 'string' && data.detail.trim()) return data.detail;
+      if (data && typeof data.error === 'string' && data.error.trim()) return data.error;
+      if (data && typeof data.title === 'string' && data.title.trim()) return data.title;
+      if (data && typeof data.message === 'string' && data.message.trim()) return data.message;
+      return 'HTTP ' + res.status;
+    }
+
+    function handleUnauthorized(res) {
+      if (res.status !== 401) return false;
+      adminToken = '';
+      localStorage.removeItem('adminToken');
+      checkAuth();
+      return true;
+    }
+
     function setButtonLoading(btn, loading, text) {
       if (!btn) return;
       if (loading) {
@@ -1557,7 +1692,13 @@ async function handler(req: Request): Promise<Response> {
     async function loadProxyKeys() {
       try {
         const res = await fetch('/api/proxy-keys', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('加载失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+
         const container = document.getElementById('proxyKeysContainer');
         const badge = document.getElementById('authBadge');
         const countLabel = document.getElementById('keyCountLabel');
@@ -1684,30 +1825,39 @@ async function handler(req: Request): Promise<Response> {
           empty.textContent = '暂无代理密钥，API 当前为公开访问';
           container.appendChild(empty);
         }
-      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+      } catch (e) { showNotification('加载失败: ' + formatClientError(e), 'error'); }
     }
 
     async function createProxyKey() {
       const name = document.getElementById('proxyKeyName').value.trim();
       try {
         const res = await fetch('/api/proxy-keys', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
-        const data = await res.json();
-        if (data.success) {
-          showNotification('密钥已创建，请立即复制保存');
-          document.getElementById('proxyKeyName').value = '';
-          loadProxyKeys();
-        } else showNotification(data.error || '创建失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '创建失败', 'error');
+          return;
+        }
+
+        showNotification('密钥已创建，请立即复制保存');
+        document.getElementById('proxyKeyName').value = '';
+        loadProxyKeys();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function deleteProxyKey(id) {
       if (!confirm('删除此密钥？使用此密钥的客户端将无法访问')) return;
       try {
         const res = await fetch('/api/proxy-keys/' + id, { method: 'DELETE', headers: getAuthHeaders() });
-        const data = await res.json();
-        if (data.success) { showNotification('密钥已删除'); loadProxyKeys(); }
-        else showNotification(data.error || '删除失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '删除失败', 'error');
+          return;
+        }
+        showNotification('密钥已删除');
+        loadProxyKeys();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     const proxyKeyFullValues = {};
@@ -1719,8 +1869,9 @@ async function handler(req: Request): Promise<Response> {
         if (!proxyKeyFullValues[id]) {
           try {
             const res = await fetch('/api/proxy-keys/' + id + '/export', { headers: getAuthHeaders() });
-            const data = await res.json();
-            if (data.key) proxyKeyFullValues[id] = data.key;
+            const data = await res.json().catch(() => ({}));
+            if (handleUnauthorized(res)) return;
+            if (res.ok && data.key) proxyKeyFullValues[id] = data.key;
           } catch (e) { return; }
         }
         if (proxyKeyFullValues[id]) {
@@ -1734,10 +1885,15 @@ async function handler(req: Request): Promise<Response> {
     async function copyProxyKey(id) {
       try {
         const res = await fetch('/api/proxy-keys/' + id + '/export', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '复制失败', 'error');
+          return;
+        }
         if (data.key) { await navigator.clipboard.writeText(data.key); showNotification('密钥已复制'); }
-        else showNotification(data.error || '复制失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        else showNotification('复制失败', 'error');
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     // API 密钥管理
@@ -1746,10 +1902,16 @@ async function handler(req: Request): Promise<Response> {
       if (!key) { showNotification('请输入密钥', 'error'); return; }
       try {
         const res = await fetch('/api/keys', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
-        const data = await res.json();
-        if (data.success) { showNotification('密钥已添加'); document.getElementById('singleKey').value = ''; loadKeys(); }
-        else showNotification(data.error || '添加失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '添加失败', 'error');
+          return;
+        }
+        showNotification('密钥已添加');
+        document.getElementById('singleKey').value = '';
+        loadKeys();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function addBatchKeys() {
@@ -1757,16 +1919,27 @@ async function handler(req: Request): Promise<Response> {
       if (!input) { showNotification('请输入密钥', 'error'); return; }
       try {
         const res = await fetch('/api/keys/batch', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ input }) });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '导入失败', 'error');
+          return;
+        }
         if (data.summary) { showNotification(\`导入完成：\${data.summary.success} 成功，\${data.summary.failed} 失败\`); document.getElementById('batchKeys').value = ''; loadKeys(); }
-        else showNotification(data.error || '导入失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        else showNotification('导入失败', 'error');
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function loadKeys() {
       try {
         const res = await fetch('/api/keys', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('加载失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+
         const container = document.getElementById('keysContainer');
         if (data.keys?.length > 0) {
           container.textContent = '';
@@ -1919,20 +2092,25 @@ async function handler(req: Request): Promise<Response> {
           empty.textContent = '暂无 API 密钥';
           container.appendChild(empty);
         }
-      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+      } catch (e) { showNotification('加载失败: ' + formatClientError(e), 'error'); }
     }
 
     async function copyKey(id) {
       try {
         const res = await fetch('/api/keys/' + id + '/export', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '复制失败', 'error');
+          return;
+        }
         if (data.key) {
           await navigator.clipboard.writeText(data.key);
           showNotification('密钥已复制');
         } else {
-          showNotification(data.error || '复制失败', 'error');
+          showNotification('复制失败', 'error');
         }
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     const keyFullValues = {};
@@ -1944,8 +2122,9 @@ async function handler(req: Request): Promise<Response> {
         if (!keyFullValues[id]) {
           try {
             const res = await fetch('/api/keys/' + id + '/export', { headers: getAuthHeaders() });
-            const data = await res.json();
-            if (data.key) keyFullValues[id] = data.key;
+            const data = await res.json().catch(() => ({}));
+            if (handleUnauthorized(res)) return;
+            if (res.ok && data.key) keyFullValues[id] = data.key;
           } catch (e) { return; }
         }
         if (keyFullValues[id]) { keySpan.textContent = keyFullValues[id]; eyeIcon.style.display = 'none'; eyeOffIcon.style.display = 'inline'; }
@@ -1956,20 +2135,25 @@ async function handler(req: Request): Promise<Response> {
       if (!confirm('删除此密钥？')) return;
       try {
         const res = await fetch('/api/keys/' + id, { method: 'DELETE', headers: getAuthHeaders() });
-        const data = await res.json();
-        if (data.success) { showNotification('密钥已删除'); loadKeys(); }
-        else showNotification(data.error || '删除失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '删除失败', 'error');
+          return;
+        }
+        showNotification('密钥已删除');
+        loadKeys();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function testKey(id, btn) {
       setButtonLoading(btn, true, '测试中...');
       try {
         const { res, data } = await fetchJsonWithTimeout('/api/keys/' + id + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
-        if (res.status === 401) {
-          adminToken = '';
-          localStorage.removeItem('adminToken');
-          checkAuth();
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('密钥测试失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
         }
 
         if (data.success) {
@@ -1990,17 +2174,28 @@ async function handler(req: Request): Promise<Response> {
     async function exportAllKeys() {
       try {
         const res = await fetch('/api/keys/export', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '导出失败', 'error');
+          return;
+        }
         if (data.keys?.length > 0) { await navigator.clipboard.writeText(data.keys.join('\\n')); showNotification(\`\${data.keys.length} 个密钥已复制\`); }
         else showNotification('没有密钥可导出', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     // 模型管理
     async function loadModels() {
       try {
         const res = await fetch('/api/models', { headers: getAuthHeaders() });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('加载失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+
         const container = document.getElementById('modelsContainer');
         if (data.models?.length > 0) {
           container.textContent = '';
@@ -2048,7 +2243,7 @@ async function handler(req: Request): Promise<Response> {
           empty.textContent = '模型池为空，使用默认模型';
           container.appendChild(empty);
         }
-      } catch (e) { showNotification('加载失败: ' + e.message, 'error'); }
+      } catch (e) { showNotification('加载失败: ' + formatClientError(e), 'error'); }
     }
 
     async function addModel() {
@@ -2056,30 +2251,41 @@ async function handler(req: Request): Promise<Response> {
       if (!model) { showNotification('请输入模型名称', 'error'); return; }
       try {
         const res = await fetch('/api/models', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) });
-        const data = await res.json();
-        if (data.success) { showNotification('模型已添加'); document.getElementById('newModel').value = ''; loadModels(); }
-        else showNotification(data.error || '添加失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '添加失败', 'error');
+          return;
+        }
+        showNotification('模型已添加');
+        document.getElementById('newModel').value = '';
+        loadModels();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function deleteModel(name) {
       if (!confirm('删除此模型？')) return;
       try {
         const res = await fetch('/api/models/' + name, { method: 'DELETE', headers: getAuthHeaders() });
-        const data = await res.json();
-        if (data.success) { showNotification('模型已删除'); loadModels(); }
-        else showNotification(data.error || '删除失败', 'error');
-      } catch (e) { showNotification('错误: ' + e.message, 'error'); }
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '删除失败', 'error');
+          return;
+        }
+        showNotification('模型已删除');
+        loadModels();
+      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
     }
 
     async function testModel(name, btn) {
       setButtonLoading(btn, true, '测试中...');
       try {
         const { res, data } = await fetchJsonWithTimeout('/api/models/' + name + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
-        if (res.status === 401) {
-          adminToken = '';
-          localStorage.removeItem('adminToken');
-          checkAuth();
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('模型测试失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
         }
         const ok = Boolean(data.success);
         const detail = data.error || data.status || (res.ok ? '' : ('HTTP ' + res.status));

@@ -115,6 +115,9 @@
 模型池（Pool）：
 
 - `GET /api/models`
+- `PUT /api/models`
+  - 描述：一次性更新模型池（会去重/trim）。
+  - 请求体：`{ "models": string[] }`
 - `POST /api/models`
   - 请求体：`{ "model": string }`
 - `DELETE /api/models/<name>`

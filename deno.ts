@@ -18,11 +18,18 @@ const MAX_PROXY_KEYS = 5;
 const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 const UPSTREAM_TEST_TIMEOUT_MS = 12000;
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
-const KV_FLUSH_INTERVAL_MS = (() => {
+const MIN_KV_FLUSH_INTERVAL_MS = 1000;
+
+function normalizeKvFlushIntervalMs(ms: number): number {
+  if (!Number.isFinite(ms)) return DEFAULT_KV_FLUSH_INTERVAL_MS;
+  return Math.max(MIN_KV_FLUSH_INTERVAL_MS, Math.trunc(ms));
+}
+
+const ENV_KV_FLUSH_INTERVAL_MS = (() => {
   const raw = (Deno.env.get("KV_FLUSH_INTERVAL_MS") ?? "").trim();
-  if (!raw) return DEFAULT_KV_FLUSH_INTERVAL_MS;
+  if (!raw) return null;
   const ms = Number.parseInt(raw, 10);
-  return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_KV_FLUSH_INTERVAL_MS;
+  return Number.isFinite(ms) ? normalizeKvFlushIntervalMs(ms) : null;
 })();
 
 const CORS_HEADERS = {
@@ -157,6 +164,7 @@ interface ProxyConfig {
   modelPool: string[];
   currentModelIndex: number;
   totalRequests: number;
+  kvFlushIntervalMs?: number;
   schemaVersion: string;
 }
 
@@ -187,6 +195,32 @@ let modelCursor = 0;
 // 代理鉴权密钥缓存
 let cachedProxyKeys = new Map<string, ProxyAuthKey>();
 const dirtyProxyKeyIds = new Set<string>();
+
+let kvFlushTimerId: number | null = null;
+let kvFlushIntervalMsEffective = DEFAULT_KV_FLUSH_INTERVAL_MS;
+let kvFlushIntervalSource: "env" | "config" = "config";
+
+function resolveKvFlushInterval(
+  config: ProxyConfig | null,
+): { ms: number; source: "env" | "config" } {
+  if (ENV_KV_FLUSH_INTERVAL_MS !== null) {
+    return { ms: ENV_KV_FLUSH_INTERVAL_MS, source: "env" };
+  }
+
+  const ms = config?.kvFlushIntervalMs ?? DEFAULT_KV_FLUSH_INTERVAL_MS;
+  return { ms: normalizeKvFlushIntervalMs(ms), source: "config" };
+}
+
+function applyKvFlushInterval(config: ProxyConfig | null): void {
+  const resolved = resolveKvFlushInterval(config);
+  kvFlushIntervalSource = resolved.source;
+  kvFlushIntervalMsEffective = resolved.ms;
+
+  if (kvFlushTimerId !== null) {
+    clearInterval(kvFlushTimerId);
+  }
+  kvFlushTimerId = setInterval(flushDirtyToKv, kvFlushIntervalMsEffective);
+}
 
 // ================================
 // 工具函数
@@ -482,6 +516,7 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
       modelPool: [...DEFAULT_MODEL_POOL],
       currentModelIndex: 0,
       totalRequests: 0,
+      kvFlushIntervalMs: DEFAULT_KV_FLUSH_INTERVAL_MS,
       schemaVersion: "3.1",
     };
     await kv.set(CONFIG_KEY, defaultConfig);
@@ -966,9 +1001,59 @@ async function handler(req: Request): Promise<Response> {
       return jsonResponse(stats);
     }
 
+    if (req.method === "PATCH" && path === "/api/config") {
+      try {
+        const body = await req.json().catch(() => ({}));
+        const raw = body.kvFlushIntervalMs;
+
+        if (typeof raw !== "number" || !Number.isFinite(raw)) {
+          return problemResponse("kvFlushIntervalMs 必须为数字", {
+            status: 400,
+            instance: path,
+          });
+        }
+
+        const normalized = normalizeKvFlushIntervalMs(raw);
+        const next = await kvUpdateConfig((config) => ({
+          ...config,
+          kvFlushIntervalMs: normalized,
+        }));
+
+        applyKvFlushInterval(next);
+
+        return jsonResponse({
+          success: true,
+          kvFlushIntervalMs: normalized,
+          effectiveKvFlushIntervalMs: kvFlushIntervalMsEffective,
+          kvFlushIntervalSource,
+          kvFlushIntervalMinMs: MIN_KV_FLUSH_INTERVAL_MS,
+        });
+      } catch (error) {
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
+      }
+    }
+
     if (req.method === "GET" && path === "/api/config") {
       const config = await kvGetConfig();
-      return jsonResponse(config);
+      const configured = normalizeKvFlushIntervalMs(
+        config.kvFlushIntervalMs ?? DEFAULT_KV_FLUSH_INTERVAL_MS,
+      );
+
+      const resolved = resolveKvFlushInterval({
+        ...config,
+        kvFlushIntervalMs: configured,
+      });
+
+      return jsonResponse({
+        ...config,
+        kvFlushIntervalMs: configured,
+        effectiveKvFlushIntervalMs: resolved.ms,
+        kvFlushIntervalSource: resolved.source,
+        kvFlushIntervalMinMs: MIN_KV_FLUSH_INTERVAL_MS,
+      });
     }
 
     // ========== 模型池管理 ==========
@@ -1470,6 +1555,15 @@ async function handler(req: Request): Promise<Response> {
         <div class="divider"></div>
         <div class="section-title">已创建的密钥</div>
         <div id="proxyKeysContainer"></div>
+
+        <div class="divider"></div>
+        <div class="section-title">高级设置</div>
+        <div class="form-group">
+          <label>KV 刷盘间隔（ms）</label>
+          <input type="number" id="kvFlushIntervalMs" class="form-control" min="1000" step="100" placeholder="例如 15000">
+          <button class="btn btn-outline" onclick="saveKvFlushIntervalMs()" style="margin-top: 8px;">保存</button>
+          <p class="hint" id="kvFlushIntervalHint">最小 1000ms。用于控制统计/用量写回 KV 的频率。</p>
+        </div>
       </div>
     </div>
 
@@ -1567,6 +1661,7 @@ async function handler(req: Request): Promise<Response> {
           loadProxyKeys();
           loadKeys();
           loadModels();
+          loadConfig();
         }
       } catch (e) { showAuthError('检查登录状态失败'); }
     }
@@ -1686,6 +1781,70 @@ async function handler(req: Request): Promise<Response> {
       btn.textContent = btn.dataset.oldText || btn.textContent || '';
       delete btn.dataset.oldText;
       btn.disabled = false;
+    }
+
+    // 配置管理
+    async function loadConfig() {
+      try {
+        const res = await fetch('/api/config', { headers: getAuthHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification('加载配置失败: ' + getApiErrorMessage(res, data), 'error');
+          return;
+        }
+
+        const input = document.getElementById('kvFlushIntervalMs');
+        if (input) {
+          input.value = String(data.kvFlushIntervalMs ?? '');
+          if (data.kvFlushIntervalMinMs) input.min = String(data.kvFlushIntervalMinMs);
+        }
+
+        const hint = document.getElementById('kvFlushIntervalHint');
+        if (hint) {
+          const effective = data.effectiveKvFlushIntervalMs ?? data.kvFlushIntervalMs;
+          const source = data.kvFlushIntervalSource
+            ? ('（生效来源：' + data.kvFlushIntervalSource + '）')
+            : '';
+          hint.textContent = '当前生效：' + String(effective ?? '') + 'ms ' + source;
+        }
+      } catch (e) {
+        showNotification('加载配置失败: ' + formatClientError(e), 'error');
+      }
+    }
+
+    async function saveKvFlushIntervalMs() {
+      const el = document.getElementById('kvFlushIntervalMs');
+      const raw = el ? el.value : '';
+      const ms = Number(raw);
+      const min = Number(el?.min || '1000');
+
+      if (!Number.isFinite(ms)) {
+        showNotification('请输入合法数字', 'error');
+        return;
+      }
+      if (ms < min) {
+        showNotification('最小 ' + String(min) + 'ms', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'PATCH',
+          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kvFlushIntervalMs: ms }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '保存失败', 'error');
+          return;
+        }
+        showNotification('已保存');
+        loadConfig();
+      } catch (e) {
+        showNotification('保存失败: ' + formatClientError(e), 'error');
+      }
     }
 
     // 代理密钥管理
@@ -2321,8 +2480,6 @@ console.log(`- 存储: Deno KV`);
 
 if (import.meta.main) {
   await bootstrapCache();
-  if (KV_FLUSH_INTERVAL_MS > 0) {
-    setInterval(flushDirtyToKv, KV_FLUSH_INTERVAL_MS);
-  }
+  applyKvFlushInterval(cachedConfig);
   serve(handler);
 }

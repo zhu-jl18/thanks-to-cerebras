@@ -1,4 +1,9 @@
-import type { ApiKey, ModelCatalog, ProxyAuthKey, ProxyConfig } from "./types.ts";
+import type {
+  ApiKey,
+  ModelCatalog,
+  ProxyAuthKey,
+  ProxyConfig,
+} from "./types.ts";
 import { DEFAULT_KV_FLUSH_INTERVAL_MS } from "./constants.ts";
 
 // Deno KV instance

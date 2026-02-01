@@ -61,12 +61,12 @@ export async function handleProxyEndpoint(req: Request): Promise<Response> {
       const cooldowns = cachedActiveKeyIds
         .map((id) => keyCooldownUntil.get(id) ?? 0)
         .filter((ms) => ms > now);
-      const minCooldownUntil =
-        cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
-      const retryAfterSeconds =
-        minCooldownUntil > now
-          ? Math.ceil((minCooldownUntil - now) / 1000)
-          : 0;
+      const minCooldownUntil = cooldowns.length > 0
+        ? Math.min(...cooldowns)
+        : 0;
+      const retryAfterSeconds = minCooldownUntil > now
+        ? Math.ceil((minCooldownUntil - now) / 1000)
+        : 0;
 
       return jsonError(
         "没有可用的 API 密钥",
@@ -116,8 +116,8 @@ export async function handleProxyEndpoint(req: Request): Promise<Response> {
         const bodyText = await clone.text().catch(() => "");
         const payload = safeJsonParse(bodyText);
 
-        const modelNotFound =
-          isModelNotFoundPayload(payload) || isModelNotFoundText(bodyText);
+        const modelNotFound = isModelNotFoundPayload(payload) ||
+          isModelNotFoundText(bodyText);
 
         if (modelNotFound) {
           lastModelNotFound = {

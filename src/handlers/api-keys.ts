@@ -31,8 +31,9 @@ export async function testKey(
     return { success: false, status: "invalid", error: "密钥不存在" };
   }
 
-  const testModel =
-    cachedModelPool.length > 0 ? cachedModelPool[0] : FALLBACK_MODEL;
+  const testModel = cachedModelPool.length > 0
+    ? cachedModelPool[0]
+    : FALLBACK_MODEL;
 
   try {
     const response = await fetchWithTimeout(
@@ -70,8 +71,8 @@ export async function testKey(
       const clone = response.clone();
       const bodyText = await clone.text().catch(() => "");
       const payload = safeJsonParse(bodyText);
-      const modelNotFound =
-        isModelNotFoundPayload(payload) || isModelNotFoundText(bodyText);
+      const modelNotFound = isModelNotFoundPayload(payload) ||
+        isModelNotFoundText(bodyText);
 
       if (modelNotFound) {
         await removeModelFromPool(testModel, "model_not_found");

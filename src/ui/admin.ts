@@ -290,7 +290,9 @@ export async function renderAdminPage(): Promise<Response> {
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
           <div>
             <span class="section-title" style="margin: 0;">代理访问密钥</span>
-            <span id="authBadge" class="auth-badge ${stats.proxyAuthEnabled ? "auth-on" : "auth-off"}">${stats.proxyAuthEnabled ? "鉴权已开启" : "公开访问"}</span>
+            <span id="authBadge" class="auth-badge ${
+    stats.proxyAuthEnabled ? "auth-on" : "auth-off"
+  }">${stats.proxyAuthEnabled ? "鉴权已开启" : "公开访问"}</span>
           </div>
           <span style="font-size: 11px; color: #64748b;" id="keyCountLabel">${stats.proxyKeyCount}/${MAX_PROXY_KEYS}</span>
         </div>

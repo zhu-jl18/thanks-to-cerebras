@@ -201,8 +201,8 @@ export async function handleModelRoutes(
         const clone = response.clone();
         const bodyText = await clone.text().catch(() => "");
         const payload = safeJsonParse(bodyText);
-        const modelNotFound =
-          isModelNotFoundPayload(payload) || isModelNotFoundText(bodyText);
+        const modelNotFound = isModelNotFoundPayload(payload) ||
+          isModelNotFoundText(bodyText);
 
         if (modelNotFound) {
           await removeModelFromPool(modelName, "model_not_found");

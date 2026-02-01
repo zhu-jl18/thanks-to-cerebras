@@ -24,7 +24,6 @@ const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const MIN_KV_FLUSH_INTERVAL_MS = 1000;
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
 const MODEL_CATALOG_FETCH_TIMEOUT_MS = 8000;
-const DISABLED_MODEL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
 const MAX_MODEL_NOT_FOUND_RETRIES = 3;
 
 function normalizeKvFlushIntervalMs(ms: number): number {
@@ -160,17 +159,11 @@ interface ProxyAuthKey {
   createdAt: number;
 }
 
-interface DisabledModelEntry {
-  disabledAt: number;
-  reason: string;
-}
-
 interface ProxyConfig {
   modelPool: string[];
   currentModelIndex: number;
   totalRequests: number;
   kvFlushIntervalMs?: number;
-  disabledModels?: Record<string, DisabledModelEntry>;
   schemaVersion: string;
 }
 
@@ -437,35 +430,17 @@ function getNextModelFast(): string | null {
   return model;
 }
 
-function pruneDisabledModels(
-  disabledModels:
-    | Record<string, { disabledAt?: unknown; reason?: unknown }>
-    | undefined,
-  now: number,
-): Record<string, DisabledModelEntry> {
-  if (!disabledModels) return {};
+function normalizeModelPool(rawPool: readonly unknown[] | undefined): string[] {
+  const base = Array.isArray(rawPool) ? rawPool : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
 
-  const out: Record<string, DisabledModelEntry> = {};
-  for (const [rawModel, entry] of Object.entries(disabledModels)) {
-    const model = rawModel.trim();
-    if (!model) continue;
-
-    const disabledAt = typeof entry.disabledAt === "number"
-      ? entry.disabledAt
-      : Number(entry.disabledAt);
-    if (!Number.isFinite(disabledAt) || disabledAt <= 0) continue;
-    if (disabledAt > now) continue;
-    if ((now - disabledAt) > DISABLED_MODEL_RETENTION_MS) continue;
-
-    const reason =
-      typeof entry.reason === "string" && entry.reason.trim().length > 0
-        ? entry.reason.trim()
-        : "model_not_found";
-
-    const existing = out[model];
-    if (!existing || disabledAt > existing.disabledAt) {
-      out[model] = { disabledAt, reason };
-    }
+  for (const m of base) {
+    const name = typeof m === "string" ? m.trim() : "";
+    if (!name) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
   }
 
   return out;
@@ -513,102 +488,40 @@ function isModelNotFoundPayload(payload: unknown): boolean {
   return false;
 }
 
-function computeEffectiveModelPool(
-  rawPool: readonly unknown[] | undefined,
-  defaultPool: readonly string[],
-  disabled: Record<string, DisabledModelEntry>,
-  fallbackModel: string,
-): string[] {
-  const basePool: readonly unknown[] = rawPool && rawPool.length > 0
-    ? rawPool
-    : defaultPool;
-
-  const seen = new Set<string>();
-  let effective = basePool
-    .map((m) => (typeof m === "string" ? m.trim() : ""))
-    .filter((m) => m.length > 0)
-    .filter((m) => !(m in disabled))
-    .filter((m) => {
-      if (seen.has(m)) return false;
-      seen.add(m);
-      return true;
-    });
-
-  if (effective.length === 0) {
-    const fallback = fallbackModel.trim();
-    if (fallback && !(fallback in disabled)) {
-      effective = [fallback];
-    }
-  }
-
-  return effective;
-}
-
-async function disableModel(model: string, reason: string): Promise<void> {
+async function removeModelFromPool(model: string, reason: string): Promise<void> {
   const trimmed = model.trim();
   if (!trimmed) return;
 
-  const now = Date.now();
+  const existed = cachedModelPool.includes(trimmed);
 
   await kvUpdateConfig((config) => {
-    const disabledModels = pruneDisabledModels(
-      config.disabledModels as
-        | Record<string, { disabledAt?: unknown; reason?: unknown }>
-        | undefined,
-      now,
-    );
+    const pool = normalizeModelPool(config.modelPool);
+    const nextPool = pool.filter((m) => m !== trimmed);
 
-    disabledModels[trimmed] = {
-      disabledAt: now,
-      reason: reason?.trim() ? reason.trim() : "model_not_found",
-    };
+    if (nextPool.length === pool.length) {
+      return {
+        ...config,
+        schemaVersion: "5.0",
+      };
+    }
 
     return {
       ...config,
-      disabledModels,
-      schemaVersion: "4.0",
+      modelPool: nextPool,
+      currentModelIndex: 0,
+      schemaVersion: "5.0",
     };
   });
 
   rebuildModelPoolCache();
-  console.warn(`[MODEL] disabled: ${trimmed}`);
+
+  if (existed) {
+    console.warn(`[MODEL] removed (${reason}): ${trimmed}`);
+  }
 }
 
 function rebuildModelPoolCache(): void {
-  const now = Date.now();
-  const disabled = pruneDisabledModels(cachedConfig?.disabledModels, now);
-
-  if (cachedConfig) {
-    const existing = cachedConfig.disabledModels ?? {};
-    const existingKeys = Object.keys(existing);
-    const nextKeys = Object.keys(disabled);
-
-    let changed = existingKeys.length !== nextKeys.length;
-
-    if (!changed) {
-      for (const k of nextKeys) {
-        const v = existing[k];
-        const n = disabled[k];
-        if (!v || v.disabledAt !== n.disabledAt || v.reason !== n.reason) {
-          changed = true;
-          break;
-        }
-      }
-    }
-
-    if (changed) {
-      cachedConfig.disabledModels = disabled;
-      cachedConfig.schemaVersion = "4.0";
-      dirtyConfig = true;
-    }
-  }
-
-  cachedModelPool = computeEffectiveModelPool(
-    cachedConfig?.modelPool,
-    DEFAULT_MODEL_POOL,
-    disabled,
-    FALLBACK_MODEL,
-  );
+  cachedModelPool = normalizeModelPool(cachedConfig?.modelPool);
 
   if (cachedModelPool.length > 0) {
     const idx = cachedConfig?.currentModelIndex ?? 0;
@@ -691,7 +604,7 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
       currentModelIndex: 0,
       totalRequests: 0,
       kvFlushIntervalMs: DEFAULT_KV_FLUSH_INTERVAL_MS,
-      schemaVersion: "4.0",
+      schemaVersion: "5.0",
     };
     await kv.set(CONFIG_KEY, defaultConfig);
     entry = await kv.get<ProxyConfig>(CONFIG_KEY);
@@ -700,7 +613,49 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
   if (!entry.value) {
     throw new Error("KV 配置初始化失败");
   }
-  return entry;
+
+  const raw = entry.value as unknown as Record<string, unknown>;
+
+  const modelPool = Array.isArray(raw.modelPool)
+    ? normalizeModelPool(raw.modelPool)
+    : [...DEFAULT_MODEL_POOL];
+
+  const currentModelIndex =
+    typeof raw.currentModelIndex === "number" && Number.isFinite(raw.currentModelIndex) &&
+      raw.currentModelIndex >= 0
+      ? Math.trunc(raw.currentModelIndex)
+      : 0;
+
+  const totalRequests =
+    typeof raw.totalRequests === "number" && Number.isFinite(raw.totalRequests) &&
+      raw.totalRequests >= 0
+      ? Math.trunc(raw.totalRequests)
+      : 0;
+
+  const kvFlushIntervalMs =
+    typeof raw.kvFlushIntervalMs === "number" && Number.isFinite(raw.kvFlushIntervalMs)
+      ? raw.kvFlushIntervalMs
+      : DEFAULT_KV_FLUSH_INTERVAL_MS;
+
+  const needsMigration = raw.schemaVersion !== "5.0" || ("disabledModels" in raw);
+
+  if (needsMigration) {
+    const nextConfig: ProxyConfig = {
+      modelPool,
+      currentModelIndex,
+      totalRequests,
+      kvFlushIntervalMs,
+      schemaVersion: "5.0",
+    };
+    await kv.set(CONFIG_KEY, nextConfig);
+    entry = await kv.get<ProxyConfig>(CONFIG_KEY);
+  }
+
+  if (!entry.value) {
+    throw new Error("KV 配置初始化失败");
+  }
+
+  return entry as Deno.KvEntry<ProxyConfig>;
 }
 
 async function kvGetConfig(): Promise<ProxyConfig> {
@@ -946,18 +901,37 @@ async function testKey(
     if (response.ok) {
       await kvUpdateKey(id, { status: "active" });
       return { success: true, status: "active" };
-    } else {
-      const nextStatus: ApiKey["status"] =
-        (response.status === 401 || response.status === 403)
-          ? "invalid"
-          : "inactive";
-      await kvUpdateKey(id, { status: nextStatus });
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      await kvUpdateKey(id, { status: "invalid" });
       return {
         success: false,
-        status: nextStatus,
+        status: "invalid",
         error: `HTTP ${response.status}`,
       };
     }
+
+    if (response.status === 404) {
+      const clone = response.clone();
+      const bodyText = await clone.text().catch(() => "");
+      const payload = safeJsonParse(bodyText);
+      const modelNotFound = isModelNotFoundPayload(payload) ||
+        isModelNotFoundText(bodyText);
+
+      if (modelNotFound) {
+        await removeModelFromPool(testModel, "model_not_found");
+        await kvUpdateKey(id, { status: "active" });
+        return { success: true, status: "active" };
+      }
+    }
+
+    await kvUpdateKey(id, { status: "inactive" });
+    return {
+      success: false,
+      status: "inactive",
+      error: `HTTP ${response.status}`,
+    };
   } catch (error) {
     const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
     await kvUpdateKey(id, { status: "inactive" });
@@ -1379,34 +1353,8 @@ async function handler(req: Request): Promise<Response> {
     // ========== 模型池管理 ==========
     if (req.method === "GET" && path === "/api/models") {
       const config = await kvGetConfig();
-      const models = config.modelPool?.length > 0
-        ? config.modelPool
-        : DEFAULT_MODEL_POOL;
-
-      const now = Date.now();
-      const disabledModels = pruneDisabledModels(
-        config.disabledModels as
-          | Record<
-            string,
-            { disabledAt?: unknown; reason?: unknown }
-          >
-          | undefined,
-        now,
-      );
-
-      const effectiveModels = computeEffectiveModelPool(
-        config.modelPool,
-        DEFAULT_MODEL_POOL,
-        disabledModels,
-        FALLBACK_MODEL,
-      );
-
-      return jsonResponse({
-        models,
-        effectiveModels,
-        disabledModels,
-        disabledModelRetentionMs: DISABLED_MODEL_RETENTION_MS,
-      });
+      const models = normalizeModelPool(config.modelPool);
+      return jsonResponse({ models });
     }
 
     if (req.method === "PUT" && path === "/api/models") {
@@ -1441,6 +1389,7 @@ async function handler(req: Request): Promise<Response> {
           ...config,
           modelPool: models,
           currentModelIndex: 0,
+          schemaVersion: "5.0",
         }));
         rebuildModelPoolCache();
 
@@ -1451,128 +1400,6 @@ async function handler(req: Request): Promise<Response> {
           instance: path,
         });
       }
-    }
-
-    if (req.method === "POST" && path === "/api/models") {
-      try {
-        const { model } = await req.json();
-        if (!model?.trim()) {
-          return problemResponse("模型名称不能为空", {
-            status: 400,
-            instance: path,
-          });
-        }
-
-        const trimmedModel = model.trim();
-        if (cachedModelPool.includes(trimmedModel)) {
-          return problemResponse("模型已存在", { status: 409, instance: path });
-        }
-
-        await kvUpdateConfig((config) => ({
-          ...config,
-          modelPool: [...config.modelPool, trimmedModel],
-        }));
-        rebuildModelPoolCache();
-
-        return jsonResponse(
-          { success: true, model: trimmedModel },
-          { status: 201 },
-        );
-      } catch (error) {
-        return problemResponse(getErrorMessage(error), {
-          status: 400,
-          instance: path,
-        });
-      }
-    }
-
-    if (req.method === "DELETE" && path === "/api/models/disabled") {
-      try {
-        await kvUpdateConfig((config) => ({
-          ...config,
-          disabledModels: {},
-          schemaVersion: "4.0",
-        }));
-        rebuildModelPoolCache();
-        return jsonResponse({ success: true });
-      } catch (error) {
-        return problemResponse(getErrorMessage(error), {
-          status: 400,
-          instance: path,
-        });
-      }
-    }
-
-    if (req.method === "DELETE" && path.startsWith("/api/models/disabled/")) {
-      const encodedName = path.substring("/api/models/disabled/".length);
-      const modelName = decodeURIComponent(encodedName).trim();
-      if (!modelName) {
-        return problemResponse("模型名称不能为空", {
-          status: 400,
-          instance: path,
-        });
-      }
-
-      const now = Date.now();
-      const currentDisabled = pruneDisabledModels(
-        cachedConfig?.disabledModels as
-          | Record<
-            string,
-            { disabledAt?: unknown; reason?: unknown }
-          >
-          | undefined,
-        now,
-      );
-      if (!(modelName in currentDisabled)) {
-        return problemResponse("模型未被禁用", { status: 404, instance: path });
-      }
-
-      try {
-        await kvUpdateConfig((config) => {
-          const disabledModels = pruneDisabledModels(
-            config.disabledModels as
-              | Record<
-                string,
-                { disabledAt?: unknown; reason?: unknown }
-              >
-              | undefined,
-            now,
-          );
-
-          delete disabledModels[modelName];
-
-          return {
-            ...config,
-            disabledModels,
-            schemaVersion: "4.0",
-          };
-        });
-        rebuildModelPoolCache();
-        return jsonResponse({ success: true });
-      } catch (error) {
-        return problemResponse(getErrorMessage(error), {
-          status: 400,
-          instance: path,
-        });
-      }
-    }
-
-    if (req.method === "DELETE" && path.startsWith("/api/models/")) {
-      const encodedName = path.substring("/api/models/".length);
-      const modelName = decodeURIComponent(encodedName);
-
-      if (!cachedModelPool.includes(modelName)) {
-        return problemResponse("模型不存在", { status: 404, instance: path });
-      }
-
-      await kvUpdateConfig((config) => ({
-        ...config,
-        modelPool: config.modelPool.filter((m) => m !== modelName),
-        currentModelIndex: 0,
-      }));
-      rebuildModelPoolCache();
-
-      return jsonResponse({ success: true });
     }
 
     if (
@@ -1609,16 +1436,34 @@ async function handler(req: Request): Promise<Response> {
 
         if (response.ok) {
           return jsonResponse({ success: true, status: "available" });
-        } else {
-          if (response.status === 401 || response.status === 403) {
-            await kvUpdateKey(activeKey.id, { status: "invalid" });
-          }
-          return jsonResponse({
-            success: false,
-            status: "unavailable",
-            error: `HTTP ${response.status}`,
-          });
         }
+
+        if (response.status === 404) {
+          const clone = response.clone();
+          const bodyText = await clone.text().catch(() => "");
+          const payload = safeJsonParse(bodyText);
+          const modelNotFound = isModelNotFoundPayload(payload) ||
+            isModelNotFoundText(bodyText);
+
+          if (modelNotFound) {
+            await removeModelFromPool(modelName, "model_not_found");
+            return jsonResponse({
+              success: false,
+              status: "model_not_found",
+              error: "model_not_found",
+            });
+          }
+        }
+
+        if (response.status === 401 || response.status === 403) {
+          await kvUpdateKey(activeKey.id, { status: "invalid" });
+        }
+
+        return jsonResponse({
+          success: false,
+          status: "unavailable",
+          error: `HTTP ${response.status}`,
+        });
       } catch (error) {
         const msg = isAbortError(error) ? "请求超时" : getErrorMessage(error);
         return jsonResponse({ success: false, status: "error", error: msg });
@@ -1729,7 +1574,7 @@ async function handler(req: Request): Promise<Response> {
             };
             apiResponse.body?.cancel();
 
-            await disableModel(targetModel, "model_not_found");
+            await removeModelFromPool(targetModel, "model_not_found");
             continue;
           }
         }
@@ -1856,6 +1701,14 @@ async function handler(req: Request): Promise<Response> {
       background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); color: #fff; border: none;
       padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500;
       transition: all 0.2s; font-family: 'Inter', sans-serif; box-shadow: 0 2px 8px rgba(6, 182, 212, 0.3);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+    }
+    .btn.is-loading {
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(6, 182, 212, 0.4); }
     body .btn-outline, body.light .btn-outline { background: transparent; color: #0891b2; border: 1px solid rgba(6, 182, 212, 0.4); box-shadow: none; }
@@ -2046,41 +1899,14 @@ async function handler(req: Request): Promise<Response> {
       <div id="modelsTab" class="tab-content">
         <p class="hint" style="margin-top: 0; margin-bottom: 14px;">模型池轮询，分散 TPM 负载</p>
 
-        <div class="section-title">可用模型目录</div>
-        <div class="form-group">
-          <label>搜索</label>
-          <div style="display: flex; gap: 8px;">
-            <input type="text" id="modelCatalogSearch" class="form-control" placeholder="搜索模型（例如 qwen / llama / glm）" style="flex: 1;">
-            <button class="btn btn-outline" onclick="refreshModelCatalog()" id="refreshModelCatalogBtn">刷新</button>
-          </div>
-          <p class="hint" id="modelCatalogHint">加载中...</p>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <span class="section-title" style="margin: 0;">可用模型目录</span>
+          <button class="btn btn-outline" onclick="refreshModelCatalog()" id="refreshModelCatalogBtn">刷新</button>
         </div>
+        <p class="hint" id="modelCatalogHint" style="margin-top: 0;">加载中...</p>
 
         <div id="modelCatalogContainer"></div>
         <button class="btn" onclick="saveModelPoolFromSelection()" style="margin-top: 8px;" id="saveModelPoolBtn">保存模型池</button>
-
-        <div class="divider"></div>
-        <div class="form-group">
-          <label>高级：手动添加自定义模型</label>
-          <input type="text" id="newModel" class="form-control" placeholder="例如 llama-3.3-70b">
-          <button class="btn" onclick="addModel()" style="margin-top: 8px;">添加</button>
-        </div>
-
-        <div class="divider"></div>
-        <div class="section-title">当前模型池（配置）</div>
-        <div id="modelsContainer"></div>
-
-        <div class="divider"></div>
-        <div class="section-title">生效模型池（自动排除禁用模型）</div>
-        <div id="effectiveModelsContainer"></div>
-
-        <div class="divider"></div>
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-          <span class="section-title" style="margin: 0;">已禁用模型（自动自愈）</span>
-          <button class="btn btn-outline" onclick="clearDisabledModels()" id="clearDisabledModelsBtn">清空禁用列表</button>
-        </div>
-        <p class="hint" id="disabledModelsHint" style="margin-top: 0;">加载中...</p>
-        <div id="disabledModelsContainer"></div>
       </div>
 
       <div id="accessTab" class="tab-content">
@@ -2148,9 +1974,6 @@ async function handler(req: Request): Promise<Response> {
     const MAX_PROXY_KEYS = ${MAX_PROXY_KEYS};
 
     let currentModelPool = [];
-    let effectiveModelPool = [];
-    let disabledModelsState = null;
-    let disabledModelRetentionMs = 0;
     let modelCatalogState = null;
 
     // 主题管理
@@ -2328,14 +2151,32 @@ async function handler(req: Request): Promise<Response> {
 
     function setButtonLoading(btn, loading, text) {
       if (!btn) return;
+
       if (loading) {
-        btn.dataset.oldText = btn.textContent || '';
+        if (!('oldText' in btn.dataset)) {
+          btn.dataset.oldText = btn.textContent || '';
+        }
+
+        const w = btn.getBoundingClientRect().width;
+        if (Number.isFinite(w) && w > 0) {
+          btn.dataset.oldWidth = String(w);
+          btn.style.width = w + 'px';
+        }
+
+        btn.classList.add('is-loading');
         btn.textContent = text || '处理中...';
         btn.disabled = true;
         return;
       }
-      btn.textContent = btn.dataset.oldText || btn.textContent || '';
+
+      if ('oldText' in btn.dataset) {
+        btn.textContent = btn.dataset.oldText || '';
+      }
+
       delete btn.dataset.oldText;
+      delete btn.dataset.oldWidth;
+      btn.style.width = '';
+      btn.classList.remove('is-loading');
       btn.disabled = false;
     }
 
@@ -2859,7 +2700,7 @@ async function handler(req: Request): Promise<Response> {
     }
 
     async function testKey(id, btn) {
-      setButtonLoading(btn, true, '测试中...');
+      setButtonLoading(btn, true, '在测');
       try {
         const { res, data } = await fetchJsonWithTimeout('/api/keys/' + id + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
         if (handleUnauthorized(res)) return;
@@ -2902,187 +2743,6 @@ async function handler(req: Request): Promise<Response> {
       try { return new Date(ms).toLocaleString(); } catch { return String(ms); }
     }
 
-    function renderEffectiveModels() {
-      const container = document.getElementById('effectiveModelsContainer');
-      if (!container) return;
-
-      const models = Array.isArray(effectiveModelPool)
-        ? effectiveModelPool.map((m) => String(m)).filter((m) => m.trim())
-        : [];
-
-      container.textContent = '';
-
-      if (models.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty-state';
-        empty.textContent = '暂无可用模型（可能全部被禁用）';
-        container.appendChild(empty);
-        return;
-      }
-
-      for (const m of models) {
-        const item = document.createElement('div');
-        item.className = 'list-item';
-
-        const info = document.createElement('div');
-        info.className = 'item-info';
-
-        const primary = document.createElement('div');
-        primary.className = 'item-primary';
-
-        const modelSpan = document.createElement('span');
-        modelSpan.className = 'key-text';
-        modelSpan.textContent = m;
-
-        primary.appendChild(modelSpan);
-        info.appendChild(primary);
-        item.appendChild(info);
-
-        container.appendChild(item);
-      }
-    }
-
-    function renderDisabledModels() {
-      const container = document.getElementById('disabledModelsContainer');
-      const hint = document.getElementById('disabledModelsHint');
-      const clearBtn = document.getElementById('clearDisabledModelsBtn');
-      if (!container || !hint) return;
-
-      const map = (disabledModelsState && typeof disabledModelsState === 'object')
-        ? disabledModelsState
-        : {};
-
-      const entries = [];
-      for (const [model, entry] of Object.entries(map)) {
-        const name = String(model || '').trim();
-        if (!name) continue;
-        const disabledAt = entry && entry.disabledAt ? Number(entry.disabledAt) : 0;
-        const reason = entry && entry.reason ? String(entry.reason) : '';
-        entries.push({ model: name, disabledAt, reason });
-      }
-
-      entries.sort((a, b) => (b.disabledAt - a.disabledAt) || a.model.localeCompare(b.model));
-
-      const days = disabledModelRetentionMs
-        ? Math.max(1, Math.round(Number(disabledModelRetentionMs) / (24 * 60 * 60 * 1000)))
-        : 0;
-
-      hint.textContent = entries.length === 0
-        ? ('暂无禁用模型' + (days ? ('；保留期：' + String(days) + ' 天') : ''))
-        : ('已禁用：' + String(entries.length) + (days ? ('；保留期：' + String(days) + ' 天') : ''));
-
-      if (clearBtn) {
-        clearBtn.disabled = entries.length === 0;
-      }
-
-      container.textContent = '';
-
-      if (entries.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty-state';
-        empty.textContent = '没有禁用模型';
-        container.appendChild(empty);
-        return;
-      }
-
-      for (const e of entries) {
-        const item = document.createElement('div');
-        item.className = 'list-item';
-
-        const info = document.createElement('div');
-        info.className = 'item-info';
-
-        const primary = document.createElement('div');
-        primary.className = 'item-primary';
-
-        const modelSpan = document.createElement('span');
-        modelSpan.className = 'key-text';
-        modelSpan.textContent = e.model;
-
-        const badge = document.createElement('span');
-        badge.className = 'status-badge status-invalid';
-        badge.textContent = 'disabled';
-
-        primary.appendChild(modelSpan);
-        primary.appendChild(badge);
-
-        const secondary = document.createElement('div');
-        secondary.className = 'item-secondary';
-        const timeText = e.disabledAt ? formatTimestamp(e.disabledAt) : '';
-        secondary.textContent = (timeText ? ('禁用时间：' + timeText) : '');
-        if (e.reason) {
-          secondary.textContent = secondary.textContent
-            ? (secondary.textContent + ' · ' + '原因：' + e.reason)
-            : ('原因：' + e.reason);
-        }
-
-        info.appendChild(primary);
-        if (secondary.textContent) info.appendChild(secondary);
-        item.appendChild(info);
-
-        const actions = document.createElement('div');
-        actions.className = 'item-actions';
-
-        const restoreBtn = document.createElement('button');
-        restoreBtn.className = 'btn btn-success';
-        restoreBtn.textContent = '恢复';
-        restoreBtn.addEventListener('click', () => restoreDisabledModel(e.model));
-
-        actions.appendChild(restoreBtn);
-        item.appendChild(actions);
-
-        container.appendChild(item);
-      }
-    }
-
-    async function restoreDisabledModel(model) {
-      const name = String(model || '').trim();
-      if (!name) return;
-
-      try {
-        const res = await fetch('/api/models/disabled/' + encodeURIComponent(name), {
-          method: 'DELETE',
-          headers: getAuthHeaders(),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (handleUnauthorized(res)) return;
-        if (!res.ok) {
-          showNotification(getApiErrorMessage(res, data) || '恢复失败', 'error');
-          return;
-        }
-        showNotification('已恢复：' + name);
-        loadModels();
-      } catch (e) {
-        showNotification('恢复失败: ' + formatClientError(e), 'error');
-      }
-    }
-
-    async function clearDisabledModels() {
-      if (!confirm('清空禁用列表？之后被禁用的模型将允许再次参与轮询。')) return;
-
-      const btn = document.getElementById('clearDisabledModelsBtn');
-      setButtonLoading(btn, true, '清空中...');
-
-      try {
-        const res = await fetch('/api/models/disabled', {
-          method: 'DELETE',
-          headers: getAuthHeaders(),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (handleUnauthorized(res)) return;
-        if (!res.ok) {
-          showNotification(getApiErrorMessage(res, data) || '清空失败', 'error');
-          return;
-        }
-        showNotification('已清空禁用列表');
-        loadModels();
-      } catch (e) {
-        showNotification('清空失败: ' + formatClientError(e), 'error');
-      } finally {
-        setButtonLoading(btn, false);
-      }
-    }
-
     function renderModelCatalog() {
       const container = document.getElementById('modelCatalogContainer');
       const hint = document.getElementById('modelCatalogHint');
@@ -3091,17 +2751,10 @@ async function handler(req: Request): Promise<Response> {
       const pool = Array.isArray(currentModelPool) ? currentModelPool.map(m => String(m)) : [];
       const poolSet = new Set(pool);
 
-      const disabled = (disabledModelsState && typeof disabledModelsState === 'object')
-        ? disabledModelsState
-        : {};
-
       const catalogModels = (modelCatalogState && Array.isArray(modelCatalogState.models))
         ? modelCatalogState.models.map(m => String(m))
         : [];
       const catalogSet = new Set(catalogModels);
-
-      const searchEl = document.getElementById('modelCatalogSearch');
-      const q = (searchEl && 'value' in searchEl ? String(searchEl.value || '') : '').trim().toLowerCase();
 
       container.textContent = '';
 
@@ -3117,7 +2770,6 @@ async function handler(req: Request): Promise<Response> {
       function addCheckboxRow(model, badgeText) {
         const name = String(model || '').trim();
         if (!name) return;
-        if (q && !name.toLowerCase().includes(q)) return;
 
         const item = document.createElement('div');
         item.className = 'list-item';
@@ -3142,17 +2794,6 @@ async function handler(req: Request): Promise<Response> {
         primary.appendChild(checkbox);
         primary.appendChild(modelSpan);
 
-        const disabledEntry = disabled && typeof disabled === 'object' ? disabled[name] : null;
-        if (disabledEntry) {
-          const badge = document.createElement('span');
-          badge.className = 'status-badge status-invalid';
-          badge.textContent = '已禁用';
-          const reason = disabledEntry.reason ? String(disabledEntry.reason) : '';
-          const disabledAt = disabledEntry.disabledAt ? formatTimestamp(disabledEntry.disabledAt) : '';
-          badge.title = (disabledAt ? ('禁用时间：' + disabledAt + '；') : '') + (reason ? ('原因：' + reason) : '');
-          primary.appendChild(badge);
-        }
-
         if (badgeText) {
           const badge = document.createElement('span');
           badge.className = 'status-badge status-inactive';
@@ -3162,6 +2803,20 @@ async function handler(req: Request): Promise<Response> {
 
         info.appendChild(primary);
         item.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+
+        const encodedName = encodeURIComponent(name);
+
+        const testBtn = document.createElement('button');
+        testBtn.className = 'btn btn-success';
+        testBtn.textContent = '测试';
+        testBtn.addEventListener('click', () => testModel(encodedName, testBtn));
+
+        actions.appendChild(testBtn);
+        item.appendChild(actions);
+
         container.appendChild(item);
       }
 
@@ -3169,9 +2824,9 @@ async function handler(req: Request): Promise<Response> {
       if (extras.length > 0) {
         const title = document.createElement('div');
         title.className = 'section-title';
-        title.textContent = '自定义/不在目录';
+        title.textContent = '不在目录';
         container.appendChild(title);
-        for (const m of extras) addCheckboxRow(m, '自定义');
+        for (const m of extras) addCheckboxRow(m, '已选');
 
         const divider = document.createElement('div');
         divider.className = 'divider';
@@ -3287,121 +2942,14 @@ async function handler(req: Request): Promise<Response> {
         }
 
         currentModelPool = Array.isArray(data.models) ? data.models.map(m => String(m)) : [];
-        effectiveModelPool = Array.isArray(data.effectiveModels) ? data.effectiveModels.map(m => String(m)) : [];
-        disabledModelsState = (data.disabledModels && typeof data.disabledModels === 'object') ? data.disabledModels : {};
-        disabledModelRetentionMs = Number(data.disabledModelRetentionMs || 0);
-
-        const container = document.getElementById('modelsContainer');
-        if (data.models?.length > 0) {
-          container.textContent = '';
-
-          for (const m of data.models) {
-            const name = String(m ?? '').trim();
-            if (!name) continue;
-
-            const item = document.createElement('div');
-            item.className = 'list-item';
-
-            const info = document.createElement('div');
-            info.className = 'item-info';
-
-            const primary = document.createElement('div');
-            primary.className = 'item-primary';
-
-            const modelSpan = document.createElement('span');
-            modelSpan.className = 'key-text';
-            modelSpan.textContent = name;
-
-            primary.appendChild(modelSpan);
-
-            const disabledEntry = disabledModelsState && typeof disabledModelsState === 'object'
-              ? disabledModelsState[name]
-              : null;
-            if (disabledEntry) {
-              const badge = document.createElement('span');
-              badge.className = 'status-badge status-invalid';
-              badge.textContent = 'disabled';
-              const reason = disabledEntry.reason ? String(disabledEntry.reason) : '';
-              const disabledAt = disabledEntry.disabledAt ? formatTimestamp(disabledEntry.disabledAt) : '';
-              badge.title = (disabledAt ? ('禁用时间：' + disabledAt + '；') : '') + (reason ? ('原因：' + reason) : '');
-              primary.appendChild(badge);
-            }
-
-            info.appendChild(primary);
-
-            const actions = document.createElement('div');
-            actions.className = 'item-actions';
-
-            const encodedName = encodeURIComponent(name);
-
-            const testBtn = document.createElement('button');
-            testBtn.className = 'btn btn-success';
-            testBtn.textContent = '测试';
-            testBtn.addEventListener('click', () => testModel(encodedName, testBtn));
-
-            const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'btn btn-danger';
-            deleteBtn.textContent = '删除';
-            deleteBtn.addEventListener('click', () => deleteModel(encodedName));
-
-            actions.appendChild(testBtn);
-            actions.appendChild(deleteBtn);
-
-            item.appendChild(info);
-            item.appendChild(actions);
-
-            container.appendChild(item);
-          }
-        } else {
-          container.textContent = '';
-          const empty = document.createElement('div');
-          empty.className = 'empty-state';
-          empty.textContent = '模型池为空（将使用默认模型）';
-          container.appendChild(empty);
-        }
-
-        renderEffectiveModels();
-        renderDisabledModels();
         renderModelCatalog();
       } catch (e) {
         showNotification('加载失败: ' + formatClientError(e), 'error');
       }
     }
 
-    async function addModel() {
-      const model = document.getElementById('newModel').value.trim();
-      if (!model) { showNotification('请输入模型名称', 'error'); return; }
-      try {
-        const res = await fetch('/api/models', { method: 'POST', headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) });
-        const data = await res.json().catch(() => ({}));
-        if (handleUnauthorized(res)) return;
-        if (!res.ok) {
-          showNotification(getApiErrorMessage(res, data) || '添加失败', 'error');
-          return;
-        }
-        showNotification('模型已添加');
-        document.getElementById('newModel').value = '';
-        loadModels();
-      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
-    }
-
-    async function deleteModel(name) {
-      if (!confirm('删除此模型？')) return;
-      try {
-        const res = await fetch('/api/models/' + name, { method: 'DELETE', headers: getAuthHeaders() });
-        const data = await res.json().catch(() => ({}));
-        if (handleUnauthorized(res)) return;
-        if (!res.ok) {
-          showNotification(getApiErrorMessage(res, data) || '删除失败', 'error');
-          return;
-        }
-        showNotification('模型已删除');
-        loadModels();
-      } catch (e) { showNotification('错误: ' + formatClientError(e), 'error'); }
-    }
-
     async function testModel(name, btn) {
-      setButtonLoading(btn, true, '测试中...');
+      setButtonLoading(btn, true, '在测');
       try {
         const { res, data } = await fetchJsonWithTimeout('/api/models/' + name + '/test', { method: 'POST', headers: getAuthHeaders() }, 15000);
         if (handleUnauthorized(res)) return;
@@ -3417,11 +2965,6 @@ async function handler(req: Request): Promise<Response> {
       } finally {
         setButtonLoading(btn, false);
       }
-    }
-
-    const modelSearch = document.getElementById('modelCatalogSearch');
-    if (modelSearch) {
-      modelSearch.addEventListener('input', () => renderModelCatalog());
     }
 
     checkAuth();

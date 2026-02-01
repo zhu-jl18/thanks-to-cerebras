@@ -38,7 +38,7 @@
 - 行为：
   - 会把请求体的 `model` 字段覆盖为模型池轮询得到的真实模型
   - 流式响应会直接透传上游 response body
-  - **自愈（Auto-disable）**：若上游返回 `404` 且错误为 `model_not_found`，代理会将该模型加入禁用列表（持久化到 KV），并立刻切换到下一个模型重试（最多 `3` 次），避免间歇性炸裂
+  - 若上游返回 `404` 且错误为 `model_not_found`，代理会把该模型从模型池中移除（持久化到 KV），并立刻切换到下一个模型重试（最多 `3` 次）
 
 常见响应码：
 
@@ -118,24 +118,11 @@
 - `GET /api/models`
   - 返回：
     - `models: string[]`：配置的模型池
-    - `effectiveModels: string[]`：生效模型池（自动排除禁用模型）
-    - `disabledModels: Record<string, { disabledAt: number, reason: string }>`：禁用模型表
-    - `disabledModelRetentionMs: number`：禁用记录保留期
 - `PUT /api/models`
   - 描述：一次性更新模型池（会去重/trim）。
   - 请求体：`{ "models": string[] }`
-- `POST /api/models`
-  - 请求体：`{ "model": string }`
-- `DELETE /api/models/<name>`
 - `POST /api/models/<name>/test`
   - 描述：用当前某个 active key 对指定模型做一次上游请求
-
-禁用模型管理（Disabled Models）：
-
-- `DELETE /api/models/disabled`
-  - 描述：清空禁用列表（允许被禁用的模型再次参与轮询）
-- `DELETE /api/models/disabled/<name>`
-  - 描述：恢复指定模型（从禁用列表中移除）
 
 ### 4.4 统计与配置
 

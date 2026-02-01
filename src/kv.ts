@@ -27,7 +27,6 @@ import { normalizeModelPool, rebuildModelPoolCache } from "./models.ts";
 import {
   cachedConfig,
   cachedKeysById,
-  cachedModelCatalog,
   cachedModelPool,
   cachedProxyKeys,
   dirtyConfig,

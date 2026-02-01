@@ -480,6 +480,13 @@ function safeJsonParse(text: string): unknown | null {
   }
 }
 
+function isModelNotFoundText(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes("model_not_found") ||
+    lower.includes("model not found") ||
+    lower.includes("no such model");
+}
+
 function isModelNotFoundPayload(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false;
 
@@ -487,10 +494,7 @@ function isModelNotFoundPayload(payload: unknown): boolean {
   const errorValue = (payload as { error?: unknown }).error;
 
   if (typeof errorValue === "string") {
-    const lower = errorValue.toLowerCase();
-    return lower.includes("model_not_found") ||
-      lower.includes("model not found") ||
-      lower.includes("no such model");
+    return isModelNotFoundText(errorValue);
   }
 
   if (!errorValue || typeof errorValue !== "object") return false;
@@ -503,13 +507,41 @@ function isModelNotFoundPayload(payload: unknown): boolean {
 
   const message = (errorValue as { message?: unknown }).message;
   if (typeof message === "string") {
-    const lower = message.toLowerCase();
-    return lower.includes("model_not_found") ||
-      lower.includes("model not found") ||
-      lower.includes("no such model");
+    return isModelNotFoundText(message);
   }
 
   return false;
+}
+
+function computeEffectiveModelPool(
+  rawPool: readonly unknown[] | undefined,
+  defaultPool: readonly string[],
+  disabled: Record<string, DisabledModelEntry>,
+  fallbackModel: string,
+): string[] {
+  const basePool: readonly unknown[] = rawPool && rawPool.length > 0
+    ? rawPool
+    : defaultPool;
+
+  const seen = new Set<string>();
+  let effective = basePool
+    .map((m) => (typeof m === "string" ? m.trim() : ""))
+    .filter((m) => m.length > 0)
+    .filter((m) => !(m in disabled))
+    .filter((m) => {
+      if (seen.has(m)) return false;
+      seen.add(m);
+      return true;
+    });
+
+  if (effective.length === 0) {
+    const fallback = fallbackModel.trim();
+    if (fallback && !(fallback in disabled)) {
+      effective = [fallback];
+    }
+  }
+
+  return effective;
 }
 
 async function disableModel(model: string, reason: string): Promise<void> {
@@ -571,28 +603,12 @@ function rebuildModelPoolCache(): void {
     }
   }
 
-  const basePool =
-    cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0
-      ? cachedConfig.modelPool
-      : DEFAULT_MODEL_POOL;
-
-  const seen = new Set<string>();
-  cachedModelPool = basePool
-    .map((m) => (typeof m === "string" ? m.trim() : ""))
-    .filter((m) => m.length > 0)
-    .filter((m) => !(m in disabled))
-    .filter((m) => {
-      if (seen.has(m)) return false;
-      seen.add(m);
-      return true;
-    });
-
-  if (cachedModelPool.length === 0) {
-    const fallback = FALLBACK_MODEL.trim();
-    if (fallback && !(fallback in disabled)) {
-      cachedModelPool = [fallback];
-    }
-  }
+  cachedModelPool = computeEffectiveModelPool(
+    cachedConfig?.modelPool,
+    DEFAULT_MODEL_POOL,
+    disabled,
+    FALLBACK_MODEL,
+  );
 
   if (cachedModelPool.length > 0) {
     const idx = cachedConfig?.currentModelIndex ?? 0;
@@ -1378,23 +1394,12 @@ async function handler(req: Request): Promise<Response> {
         now,
       );
 
-      const seen = new Set<string>();
-      let effectiveModels = models
-        .map((m) => (typeof m === "string" ? m.trim() : ""))
-        .filter((m) => m.length > 0)
-        .filter((m) => !(m in disabledModels))
-        .filter((m) => {
-          if (seen.has(m)) return false;
-          seen.add(m);
-          return true;
-        });
-
-      if (effectiveModels.length === 0) {
-        const fallback = FALLBACK_MODEL.trim();
-        if (fallback && !(fallback in disabledModels)) {
-          effectiveModels = [fallback];
-        }
-      }
+      const effectiveModels = computeEffectiveModelPool(
+        config.modelPool,
+        DEFAULT_MODEL_POOL,
+        disabledModels,
+        FALLBACK_MODEL,
+      );
 
       return jsonResponse({
         models,
@@ -1711,12 +1716,9 @@ async function handler(req: Request): Promise<Response> {
           const clone = apiResponse.clone();
           const bodyText = await clone.text().catch(() => "");
           const payload = safeJsonParse(bodyText);
-          const lower = bodyText.toLowerCase();
 
           const modelNotFound = isModelNotFoundPayload(payload) ||
-            lower.includes("model_not_found") ||
-            lower.includes("model not found") ||
-            lower.includes("no such model");
+            isModelNotFoundText(bodyText);
 
           if (modelNotFound) {
             lastModelNotFound = {

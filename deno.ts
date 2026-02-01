@@ -19,6 +19,7 @@ const KV_ATOMIC_MAX_RETRIES = 10;
 const MAX_PROXY_KEYS = 5;
 const ADMIN_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 const UPSTREAM_TEST_TIMEOUT_MS = 12000;
+const PROXY_REQUEST_TIMEOUT_MS = 60000;
 const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const MIN_KV_FLUSH_INTERVAL_MS = 1000;
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
@@ -1686,14 +1687,25 @@ async function handler(req: Request): Promise<Response> {
         }
         requestBody.model = targetModel;
 
-        const apiResponse = await fetch(CEREBRAS_API_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKeyData.key}`,
-          },
-          body: JSON.stringify(requestBody),
-        });
+        let apiResponse: Response;
+        try {
+          apiResponse = await fetchWithTimeout(
+            CEREBRAS_API_URL,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKeyData.key}`,
+              },
+              body: JSON.stringify(requestBody),
+            },
+            PROXY_REQUEST_TIMEOUT_MS,
+          );
+        } catch (error) {
+          const timeout = isAbortError(error);
+          const msg = timeout ? "上游请求超时" : getErrorMessage(error);
+          return jsonError(msg, timeout ? 504 : 502);
+        }
 
         if (apiResponse.status === 404) {
           const clone = apiResponse.clone();

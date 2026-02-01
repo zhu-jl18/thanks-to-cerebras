@@ -37,6 +37,8 @@
 - 模型池轮询
   - 自动切换模型，进一步分散负载
   - 支持配置多个模型，请求时自动切换到池中下一个模型
+  - 支持从 Cerebras public models 拉取“模型目录”，在面板勾选生成模型池
+  - **自愈（auto-disable）**：遇到上游 `model_not_found` 会自动禁用该模型并跳过，避免间歇性失败（可在面板恢复/清空）
   - 对外暴露统一模型名 `cerebras-translator`
 - Web 管理面板
   - 管理面板需要登录访问，确保数据安全
@@ -147,7 +149,9 @@ KV 数据存储在 `.deno-kv-local/kv.sqlite3`。
 
 - `GET/POST/DELETE /api/proxy-keys` - 代理密钥管理
 - `GET/POST/DELETE /api/keys` - Cerebras API 密钥管理
-- `GET/POST/DELETE /api/models` - 模型池管理
+- `GET/PUT/POST/DELETE /api/models` - 模型池管理
+- `GET /api/models/catalog` / `POST /api/models/catalog/refresh` - 模型目录
+- `DELETE /api/models/disabled` / `DELETE /api/models/disabled/<name>` - 禁用模型管理
 - `GET /api/stats` - 统计信息
 
 ## Acknowledgments

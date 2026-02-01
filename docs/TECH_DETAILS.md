@@ -36,6 +36,7 @@ function isProxyAuthorized(req: Request) {
 - 对外暴露虚拟模型名 `cerebras-translator`（见 `GET /v1/models`）
 - 内部按 Round-Robin 选择真实模型
 - 轮询游标持久化到 KV
+- **自愈（auto-disable）**：遇到上游 `404 model_not_found` 会自动将该模型加入禁用列表，并在生效模型池中排除（默认保留 30 天，可在管理面板恢复/清空）
 
 ## KV 数据结构
 
@@ -46,7 +47,8 @@ function isProxyAuthorized(req: Request) {
   currentModelIndex: number,
   totalRequests: number,
   kvFlushIntervalMs: number,
-  schemaVersion: '3.1'
+  disabledModels?: Record<string, { disabledAt: number; reason: string }>,
+  schemaVersion: '4.0'
 }
 
 // 管理员密码

@@ -157,6 +157,9 @@ export async function handleProxyEndpoint(req: Request): Promise<Response> {
 
     if (lastModelNotFound) {
       const responseHeaders = new Headers(lastModelNotFound.headers);
+      responseHeaders.delete("content-encoding");
+      responseHeaders.delete("content-length");
+      responseHeaders.delete("transfer-encoding");
       Object.entries(CORS_HEADERS).forEach(([key, value]) => {
         responseHeaders.set(key, value);
       });

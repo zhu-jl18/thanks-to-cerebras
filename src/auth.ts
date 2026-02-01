@@ -4,11 +4,7 @@ import {
   ADMIN_TOKEN_PREFIX,
 } from "./constants.ts";
 import { hashPassword, verifyPbkdf2Password } from "./crypto.ts";
-import {
-  cachedProxyKeys,
-  dirtyProxyKeyIds,
-  kv,
-} from "./state.ts";
+import { cachedProxyKeys, dirtyProxyKeyIds, kv } from "./state.ts";
 
 // Admin password management
 export async function getAdminPassword(): Promise<string | null> {

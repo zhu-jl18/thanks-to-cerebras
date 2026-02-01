@@ -2,8 +2,8 @@ import {
   cachedConfig,
   cachedModelPool,
   modelCursor,
-  setDirtyConfig,
   setCachedModelPool,
+  setDirtyConfig,
   setModelCursor,
 } from "./state.ts";
 

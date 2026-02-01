@@ -58,10 +58,9 @@ export function getNextApiKeyFast(
 
 export function markKeyCooldownFrom429(id: string, response: Response): void {
   const retryAfter = response.headers.get("retry-after")?.trim();
-  const retryAfterMs =
-    retryAfter && /^\d+$/.test(retryAfter)
-      ? Number.parseInt(retryAfter, 10) * 1000
-      : 2000;
+  const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter)
+    ? Number.parseInt(retryAfter, 10) * 1000
+    : 2000;
   keyCooldownUntil.set(id, Date.now() + Math.max(0, retryAfterMs));
 }
 

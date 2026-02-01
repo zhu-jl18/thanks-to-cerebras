@@ -1,4 +1,9 @@
-import type { ApiKey, ModelCatalog, ProxyAuthKey, ProxyConfig } from "./types.ts";
+import type {
+  ApiKey,
+  ModelCatalog,
+  ProxyAuthKey,
+  ProxyConfig,
+} from "./types.ts";
 import {
   API_KEY_PREFIX,
   CEREBRAS_PUBLIC_MODELS_URL,
@@ -12,7 +17,11 @@ import {
   PROXY_KEY_PREFIX,
 } from "./constants.ts";
 import { generateProxyKey } from "./keys.ts";
-import { fetchWithTimeout, generateId, normalizeKvFlushIntervalMs } from "./utils.ts";
+import {
+  fetchWithTimeout,
+  generateId,
+  normalizeKvFlushIntervalMs,
+} from "./utils.ts";
 import { rebuildActiveKeyIds } from "./api-keys.ts";
 import { normalizeModelPool, rebuildModelPoolCache } from "./models.ts";
 import {
@@ -119,7 +128,9 @@ export async function bootstrapCache(): Promise<void> {
 }
 
 // Config operations
-export async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
+export async function kvEnsureConfigEntry(): Promise<
+  Deno.KvEntry<ProxyConfig>
+> {
   let entry = await kv.get<ProxyConfig>(CONFIG_KEY);
 
   if (!entry.value) {
@@ -144,28 +155,24 @@ export async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> 
     ? normalizeModelPool(raw.modelPool)
     : [...DEFAULT_MODEL_POOL];
 
-  const currentModelIndex =
-    typeof raw.currentModelIndex === "number" &&
-    Number.isFinite(raw.currentModelIndex) &&
-    raw.currentModelIndex >= 0
-      ? Math.trunc(raw.currentModelIndex)
-      : 0;
+  const currentModelIndex = typeof raw.currentModelIndex === "number" &&
+      Number.isFinite(raw.currentModelIndex) &&
+      raw.currentModelIndex >= 0
+    ? Math.trunc(raw.currentModelIndex)
+    : 0;
 
-  const totalRequests =
-    typeof raw.totalRequests === "number" &&
-    Number.isFinite(raw.totalRequests) &&
-    raw.totalRequests >= 0
-      ? Math.trunc(raw.totalRequests)
-      : 0;
+  const totalRequests = typeof raw.totalRequests === "number" &&
+      Number.isFinite(raw.totalRequests) &&
+      raw.totalRequests >= 0
+    ? Math.trunc(raw.totalRequests)
+    : 0;
 
-  const kvFlushIntervalMs =
-    typeof raw.kvFlushIntervalMs === "number" &&
-    Number.isFinite(raw.kvFlushIntervalMs)
-      ? raw.kvFlushIntervalMs
-      : DEFAULT_KV_FLUSH_INTERVAL_MS;
+  const kvFlushIntervalMs = typeof raw.kvFlushIntervalMs === "number" &&
+      Number.isFinite(raw.kvFlushIntervalMs)
+    ? raw.kvFlushIntervalMs
+    : DEFAULT_KV_FLUSH_INTERVAL_MS;
 
-  const needsMigration =
-    raw.schemaVersion !== "5.0" || "disabledModels" in raw;
+  const needsMigration = raw.schemaVersion !== "5.0" || "disabledModels" in raw;
 
   if (needsMigration) {
     const nextConfig: ProxyConfig = {
@@ -251,13 +258,13 @@ export async function refreshModelCatalog(): Promise<ModelCatalog> {
 
     const ids = Array.isArray(rawModels)
       ? rawModels
-          .map((m) => {
-            if (!m || typeof m !== "object") return "";
-            if (!("id" in m)) return "";
-            const id = (m as { id?: unknown }).id;
-            return typeof id === "string" ? id.trim() : "";
-          })
-          .filter((id) => id.length > 0)
+        .map((m) => {
+          if (!m || typeof m !== "object") return "";
+          if (!("id" in m)) return "";
+          const id = (m as { id?: unknown }).id;
+          return typeof id === "string" ? id.trim() : "";
+        })
+        .filter((id) => id.length > 0)
       : [];
 
     const seen = new Set<string>();

@@ -9,7 +9,11 @@ export const CONFIG_KEY = [KV_PREFIX, "meta", "config"] as const;
 export const MODEL_CATALOG_KEY = [KV_PREFIX, "meta", "model_catalog"] as const;
 export const API_KEY_PREFIX = [KV_PREFIX, "keys", "api"] as const;
 export const PROXY_KEY_PREFIX = [KV_PREFIX, "keys", "proxy"] as const;
-export const ADMIN_PASSWORD_KEY = [KV_PREFIX, "meta", "admin_password"] as const;
+export const ADMIN_PASSWORD_KEY = [
+  KV_PREFIX,
+  "meta",
+  "admin_password",
+] as const;
 export const ADMIN_TOKEN_PREFIX = [KV_PREFIX, "auth", "token"] as const;
 
 // Retry and limits

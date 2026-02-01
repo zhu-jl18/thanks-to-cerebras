@@ -13,8 +13,17 @@ export const kv = await (() => {
   const kvDir = `${import.meta.dirname}/.deno-kv-local`;
   try {
     Deno.mkdirSync(kvDir, { recursive: true });
-  } catch {
-    /* exists */
+  } catch (e) {
+    if (
+      e instanceof Deno.errors.AlreadyExists ||
+      (typeof e === "object" && e !== null && "name" in e &&
+        (e as { name?: string }).name === "AlreadyExists")
+    ) {
+      // Directory already exists
+    } else {
+      console.error("[KV] 无法创建本地 KV 目录：", e);
+      throw e;
+    }
   }
   return Deno.openKv(`${kvDir}/kv.sqlite3`);
 })();

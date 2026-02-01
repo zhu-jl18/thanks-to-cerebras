@@ -11,6 +11,7 @@ import {
   DEFAULT_KV_FLUSH_INTERVAL_MS,
   DEFAULT_MODEL_POOL,
   KV_ATOMIC_MAX_RETRIES,
+  MAX_PROXY_KEYS,
   MODEL_CATALOG_FETCH_TIMEOUT_MS,
   MODEL_CATALOG_KEY,
   MODEL_CATALOG_TTL_MS,
@@ -203,6 +204,10 @@ export async function kvUpdateConfig(
   for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
     const entry = await kvEnsureConfigEntry();
     const nextConfig = await updater(entry.value);
+    if (nextConfig === entry.value) {
+      setCachedConfig(entry.value);
+      return entry.value;
+    }
     const result = await kv
       .atomic()
       .check(entry)
@@ -312,10 +317,7 @@ export async function removeModelFromPool(
     const nextPool = pool.filter((m) => m !== trimmed);
 
     if (nextPool.length === pool.length) {
-      return {
-        ...config,
-        schemaVersion: "5.0",
-      };
+      return config;
     }
 
     return {
@@ -393,9 +395,9 @@ export async function kvUpdateKey(
   const existing = cachedKeysById.get(id) ?? (await kv.get<ApiKey>(key)).value;
   if (!existing) return;
   const updated = { ...existing, ...updates };
+  await kv.set(key, updated);
   cachedKeysById.set(id, updated);
   rebuildActiveKeyIds();
-  await kv.set(key, updated);
 }
 
 // Proxy key operations
@@ -411,7 +413,6 @@ export async function kvGetAllProxyKeys(): Promise<ProxyAuthKey[]> {
 export async function kvAddProxyKey(
   name: string,
 ): Promise<{ success: boolean; id?: string; key?: string; error?: string }> {
-  const { MAX_PROXY_KEYS } = await import("./constants.ts");
   if (cachedProxyKeys.size >= MAX_PROXY_KEYS) {
     return {
       success: false,
@@ -439,7 +440,8 @@ export async function kvDeleteProxyKey(
   id: string,
 ): Promise<{ success: boolean; error?: string }> {
   const key = [...PROXY_KEY_PREFIX, id];
-  if (!cachedProxyKeys.has(id)) {
+  const result = await kv.get(key);
+  if (!result.value) {
     return { success: false, error: "密钥不存在" };
   }
 

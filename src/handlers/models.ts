@@ -163,7 +163,22 @@ export async function handleModelRoutes(
   ) {
     const parts = path.split("/");
     const encodedName = parts[3];
-    const modelName = decodeURIComponent(encodedName);
+    if (!encodedName) {
+      return problemResponse("缺少模型名称", {
+        status: 400,
+        instance: path,
+      });
+    }
+
+    let modelName: string;
+    try {
+      modelName = decodeURIComponent(encodedName);
+    } catch (_error) {
+      return problemResponse("模型名称 URL 编码非法", {
+        status: 400,
+        instance: path,
+      });
+    }
 
     const activeKey = Array.from(cachedKeysById.values()).find(
       (k) => k.status === "active",

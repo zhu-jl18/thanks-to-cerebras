@@ -23,6 +23,8 @@ const DEFAULT_KV_FLUSH_INTERVAL_MS = 15000;
 const MIN_KV_FLUSH_INTERVAL_MS = 1000;
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时
 const MODEL_CATALOG_FETCH_TIMEOUT_MS = 8000;
+const DISABLED_MODEL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+const MAX_MODEL_NOT_FOUND_RETRIES = 3;
 
 function normalizeKvFlushIntervalMs(ms: number): number {
   if (!Number.isFinite(ms)) return DEFAULT_KV_FLUSH_INTERVAL_MS;
@@ -157,11 +159,17 @@ interface ProxyAuthKey {
   createdAt: number;
 }
 
+interface DisabledModelEntry {
+  disabledAt: number;
+  reason: string;
+}
+
 interface ProxyConfig {
   modelPool: string[];
   currentModelIndex: number;
   totalRequests: number;
   kvFlushIntervalMs?: number;
+  disabledModels?: Record<string, DisabledModelEntry>;
   schemaVersion: string;
 }
 
@@ -412,9 +420,9 @@ function markKeyInvalid(id: string): void {
   rebuildActiveKeyIds();
 }
 
-function getNextModelFast(): string {
+function getNextModelFast(): string | null {
   if (cachedModelPool.length === 0) {
-    return FALLBACK_MODEL;
+    return null;
   }
   const idx = modelCursor % cachedModelPool.length;
   const model = cachedModelPool[idx];
@@ -428,17 +436,170 @@ function getNextModelFast(): string {
   return model;
 }
 
-function rebuildModelPoolCache(): void {
-  if (
-    cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0
-  ) {
-    cachedModelPool = [...cachedConfig.modelPool];
-    modelCursor = (cachedConfig.currentModelIndex ?? 0) %
-      cachedModelPool.length;
-  } else {
-    cachedModelPool = [...DEFAULT_MODEL_POOL];
-    modelCursor = 0;
+function pruneDisabledModels(
+  disabledModels:
+    | Record<string, { disabledAt?: unknown; reason?: unknown }>
+    | undefined,
+  now: number,
+): Record<string, DisabledModelEntry> {
+  if (!disabledModels) return {};
+
+  const out: Record<string, DisabledModelEntry> = {};
+  for (const [rawModel, entry] of Object.entries(disabledModels)) {
+    const model = rawModel.trim();
+    if (!model) continue;
+
+    const disabledAt = typeof entry.disabledAt === "number"
+      ? entry.disabledAt
+      : Number(entry.disabledAt);
+    if (!Number.isFinite(disabledAt) || disabledAt <= 0) continue;
+    if (disabledAt > now) continue;
+    if ((now - disabledAt) > DISABLED_MODEL_RETENTION_MS) continue;
+
+    const reason =
+      typeof entry.reason === "string" && entry.reason.trim().length > 0
+        ? entry.reason.trim()
+        : "model_not_found";
+
+    const existing = out[model];
+    if (!existing || disabledAt > existing.disabledAt) {
+      out[model] = { disabledAt, reason };
+    }
   }
+
+  return out;
+}
+
+function safeJsonParse(text: string): unknown | null {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function isModelNotFoundPayload(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+
+  if (!("error" in payload)) return false;
+  const errorValue = (payload as { error?: unknown }).error;
+
+  if (typeof errorValue === "string") {
+    const lower = errorValue.toLowerCase();
+    return lower.includes("model_not_found") ||
+      lower.includes("model not found") ||
+      lower.includes("no such model");
+  }
+
+  if (!errorValue || typeof errorValue !== "object") return false;
+
+  const code = (errorValue as { code?: unknown }).code;
+  if (code === "model_not_found") return true;
+
+  const type = (errorValue as { type?: unknown }).type;
+  if (type === "model_not_found") return true;
+
+  const message = (errorValue as { message?: unknown }).message;
+  if (typeof message === "string") {
+    const lower = message.toLowerCase();
+    return lower.includes("model_not_found") ||
+      lower.includes("model not found") ||
+      lower.includes("no such model");
+  }
+
+  return false;
+}
+
+async function disableModel(model: string, reason: string): Promise<void> {
+  const trimmed = model.trim();
+  if (!trimmed) return;
+
+  const now = Date.now();
+
+  await kvUpdateConfig((config) => {
+    const disabledModels = pruneDisabledModels(
+      config.disabledModels as
+        | Record<string, { disabledAt?: unknown; reason?: unknown }>
+        | undefined,
+      now,
+    );
+
+    disabledModels[trimmed] = {
+      disabledAt: now,
+      reason: reason?.trim() ? reason.trim() : "model_not_found",
+    };
+
+    return {
+      ...config,
+      disabledModels,
+      schemaVersion: "4.0",
+    };
+  });
+
+  rebuildModelPoolCache();
+  console.warn(`[MODEL] disabled: ${trimmed}`);
+}
+
+function rebuildModelPoolCache(): void {
+  const now = Date.now();
+  const disabled = pruneDisabledModels(cachedConfig?.disabledModels, now);
+
+  if (cachedConfig) {
+    const existing = cachedConfig.disabledModels ?? {};
+    const existingKeys = Object.keys(existing);
+    const nextKeys = Object.keys(disabled);
+
+    let changed = existingKeys.length !== nextKeys.length;
+
+    if (!changed) {
+      for (const k of nextKeys) {
+        const v = existing[k];
+        const n = disabled[k];
+        if (!v || v.disabledAt !== n.disabledAt || v.reason !== n.reason) {
+          changed = true;
+          break;
+        }
+      }
+    }
+
+    if (changed) {
+      cachedConfig.disabledModels = disabled;
+      cachedConfig.schemaVersion = "4.0";
+      dirtyConfig = true;
+    }
+  }
+
+  const basePool =
+    cachedConfig && cachedConfig.modelPool && cachedConfig.modelPool.length > 0
+      ? cachedConfig.modelPool
+      : DEFAULT_MODEL_POOL;
+
+  const seen = new Set<string>();
+  cachedModelPool = basePool
+    .map((m) => (typeof m === "string" ? m.trim() : ""))
+    .filter((m) => m.length > 0)
+    .filter((m) => !(m in disabled))
+    .filter((m) => {
+      if (seen.has(m)) return false;
+      seen.add(m);
+      return true;
+    });
+
+  if (cachedModelPool.length === 0) {
+    const fallback = FALLBACK_MODEL.trim();
+    if (fallback && !(fallback in disabled)) {
+      cachedModelPool = [fallback];
+    }
+  }
+
+  if (cachedModelPool.length > 0) {
+    const idx = cachedConfig?.currentModelIndex ?? 0;
+    modelCursor = idx % cachedModelPool.length;
+    return;
+  }
+
+  modelCursor = 0;
 }
 
 async function flushDirtyToKv(): Promise<void> {
@@ -513,7 +674,7 @@ async function kvEnsureConfigEntry(): Promise<Deno.KvEntry<ProxyConfig>> {
       currentModelIndex: 0,
       totalRequests: 0,
       kvFlushIntervalMs: DEFAULT_KV_FLUSH_INTERVAL_MS,
-      schemaVersion: "3.1",
+      schemaVersion: "4.0",
     };
     await kv.set(CONFIG_KEY, defaultConfig);
     entry = await kv.get<ProxyConfig>(CONFIG_KEY);
@@ -1204,7 +1365,42 @@ async function handler(req: Request): Promise<Response> {
       const models = config.modelPool?.length > 0
         ? config.modelPool
         : DEFAULT_MODEL_POOL;
-      return jsonResponse({ models });
+
+      const now = Date.now();
+      const disabledModels = pruneDisabledModels(
+        config.disabledModels as
+          | Record<
+            string,
+            { disabledAt?: unknown; reason?: unknown }
+          >
+          | undefined,
+        now,
+      );
+
+      const seen = new Set<string>();
+      let effectiveModels = models
+        .map((m) => (typeof m === "string" ? m.trim() : ""))
+        .filter((m) => m.length > 0)
+        .filter((m) => !(m in disabledModels))
+        .filter((m) => {
+          if (seen.has(m)) return false;
+          seen.add(m);
+          return true;
+        });
+
+      if (effectiveModels.length === 0) {
+        const fallback = FALLBACK_MODEL.trim();
+        if (fallback && !(fallback in disabledModels)) {
+          effectiveModels = [fallback];
+        }
+      }
+
+      return jsonResponse({
+        models,
+        effectiveModels,
+        disabledModels,
+        disabledModelRetentionMs: DISABLED_MODEL_RETENTION_MS,
+      });
     }
 
     if (req.method === "PUT" && path === "/api/models") {
@@ -1276,6 +1472,77 @@ async function handler(req: Request): Promise<Response> {
           { success: true, model: trimmedModel },
           { status: 201 },
         );
+      } catch (error) {
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
+      }
+    }
+
+    if (req.method === "DELETE" && path === "/api/models/disabled") {
+      try {
+        await kvUpdateConfig((config) => ({
+          ...config,
+          disabledModels: {},
+          schemaVersion: "4.0",
+        }));
+        rebuildModelPoolCache();
+        return jsonResponse({ success: true });
+      } catch (error) {
+        return problemResponse(getErrorMessage(error), {
+          status: 400,
+          instance: path,
+        });
+      }
+    }
+
+    if (req.method === "DELETE" && path.startsWith("/api/models/disabled/")) {
+      const encodedName = path.substring("/api/models/disabled/".length);
+      const modelName = decodeURIComponent(encodedName).trim();
+      if (!modelName) {
+        return problemResponse("模型名称不能为空", {
+          status: 400,
+          instance: path,
+        });
+      }
+
+      const now = Date.now();
+      const currentDisabled = pruneDisabledModels(
+        cachedConfig?.disabledModels as
+          | Record<
+            string,
+            { disabledAt?: unknown; reason?: unknown }
+          >
+          | undefined,
+        now,
+      );
+      if (!(modelName in currentDisabled)) {
+        return problemResponse("模型未被禁用", { status: 404, instance: path });
+      }
+
+      try {
+        await kvUpdateConfig((config) => {
+          const disabledModels = pruneDisabledModels(
+            config.disabledModels as
+              | Record<
+                string,
+                { disabledAt?: unknown; reason?: unknown }
+              >
+              | undefined,
+            now,
+          );
+
+          delete disabledModels[modelName];
+
+          return {
+            ...config,
+            disabledModels,
+            schemaVersion: "4.0",
+          };
+        });
+        rebuildModelPoolCache();
+        return jsonResponse({ success: true });
       } catch (error) {
         return problemResponse(getErrorMessage(error), {
           status: 400,
@@ -1382,8 +1649,6 @@ async function handler(req: Request): Promise<Response> {
 
     try {
       const requestBody = await req.json();
-      const targetModel = getNextModelFast();
-      requestBody.model = targetModel;
 
       const apiKeyData = getNextApiKeyFast(Date.now());
       if (!apiKeyData) {
@@ -1407,35 +1672,93 @@ async function handler(req: Request): Promise<Response> {
         );
       }
 
-      const apiResponse = await fetch(CEREBRAS_API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKeyData.key}`,
-        },
-        body: JSON.stringify(requestBody),
-      });
+      let lastModelNotFound: {
+        status: number;
+        statusText: string;
+        headers: Headers;
+        bodyText: string;
+      } | null = null;
 
-      if (apiResponse.status === 429) {
-        markKeyCooldownFrom429(apiKeyData.id, apiResponse);
+      for (let attempt = 0; attempt < MAX_MODEL_NOT_FOUND_RETRIES; attempt++) {
+        const targetModel = getNextModelFast();
+        if (!targetModel) {
+          return jsonError("没有可用的模型", 503);
+        }
+        requestBody.model = targetModel;
+
+        const apiResponse = await fetch(CEREBRAS_API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKeyData.key}`,
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (apiResponse.status === 404) {
+          const clone = apiResponse.clone();
+          const bodyText = await clone.text().catch(() => "");
+          const payload = safeJsonParse(bodyText);
+          const lower = bodyText.toLowerCase();
+
+          const modelNotFound = isModelNotFoundPayload(payload) ||
+            lower.includes("model_not_found") ||
+            lower.includes("model not found") ||
+            lower.includes("no such model");
+
+          if (modelNotFound) {
+            lastModelNotFound = {
+              status: apiResponse.status,
+              statusText: apiResponse.statusText,
+              headers: new Headers(apiResponse.headers),
+              bodyText,
+            };
+            apiResponse.body?.cancel();
+
+            await disableModel(targetModel, "model_not_found");
+            continue;
+          }
+        }
+
+        if (apiResponse.status === 429) {
+          markKeyCooldownFrom429(apiKeyData.id, apiResponse);
+        }
+        if (apiResponse.status === 401 || apiResponse.status === 403) {
+          markKeyInvalid(apiKeyData.id);
+        }
+
+        const responseHeaders = new Headers(apiResponse.headers);
+        Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+          responseHeaders.set(key, value);
+        });
+        Object.entries(NO_CACHE_HEADERS).forEach(([key, value]) => {
+          responseHeaders.set(key, value);
+        });
+
+        return new Response(apiResponse.body, {
+          status: apiResponse.status,
+          statusText: apiResponse.statusText,
+          headers: responseHeaders,
+        });
       }
-      if (apiResponse.status === 401 || apiResponse.status === 403) {
-        markKeyInvalid(apiKeyData.id);
+
+      if (lastModelNotFound) {
+        const responseHeaders = new Headers(lastModelNotFound.headers);
+        Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+          responseHeaders.set(key, value);
+        });
+        Object.entries(NO_CACHE_HEADERS).forEach(([key, value]) => {
+          responseHeaders.set(key, value);
+        });
+
+        return new Response(lastModelNotFound.bodyText, {
+          status: lastModelNotFound.status,
+          statusText: lastModelNotFound.statusText,
+          headers: responseHeaders,
+        });
       }
 
-      const responseHeaders = new Headers(apiResponse.headers);
-      Object.entries(CORS_HEADERS).forEach(([key, value]) => {
-        responseHeaders.set(key, value);
-      });
-      Object.entries(NO_CACHE_HEADERS).forEach(([key, value]) => {
-        responseHeaders.set(key, value);
-      });
-
-      return new Response(apiResponse.body, {
-        status: apiResponse.status,
-        statusText: apiResponse.statusText,
-        headers: responseHeaders,
-      });
+      return jsonError("模型不可用", 502);
     } catch (error) {
       return jsonError(getErrorMessage(error));
     }
@@ -1730,8 +2053,20 @@ async function handler(req: Request): Promise<Response> {
         </div>
 
         <div class="divider"></div>
-        <div class="section-title">当前模型池</div>
+        <div class="section-title">当前模型池（配置）</div>
         <div id="modelsContainer"></div>
+
+        <div class="divider"></div>
+        <div class="section-title">生效模型池（自动排除禁用模型）</div>
+        <div id="effectiveModelsContainer"></div>
+
+        <div class="divider"></div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <span class="section-title" style="margin: 0;">已禁用模型（自动自愈）</span>
+          <button class="btn btn-outline" onclick="clearDisabledModels()" id="clearDisabledModelsBtn">清空禁用列表</button>
+        </div>
+        <p class="hint" id="disabledModelsHint" style="margin-top: 0;">加载中...</p>
+        <div id="disabledModelsContainer"></div>
       </div>
 
       <div id="accessTab" class="tab-content">
@@ -1799,6 +2134,9 @@ async function handler(req: Request): Promise<Response> {
     const MAX_PROXY_KEYS = ${MAX_PROXY_KEYS};
 
     let currentModelPool = [];
+    let effectiveModelPool = [];
+    let disabledModelsState = null;
+    let disabledModelRetentionMs = 0;
     let modelCatalogState = null;
 
     // 主题管理
@@ -2550,6 +2888,187 @@ async function handler(req: Request): Promise<Response> {
       try { return new Date(ms).toLocaleString(); } catch { return String(ms); }
     }
 
+    function renderEffectiveModels() {
+      const container = document.getElementById('effectiveModelsContainer');
+      if (!container) return;
+
+      const models = Array.isArray(effectiveModelPool)
+        ? effectiveModelPool.map((m) => String(m)).filter((m) => m.trim())
+        : [];
+
+      container.textContent = '';
+
+      if (models.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = '暂无可用模型（可能全部被禁用）';
+        container.appendChild(empty);
+        return;
+      }
+
+      for (const m of models) {
+        const item = document.createElement('div');
+        item.className = 'list-item';
+
+        const info = document.createElement('div');
+        info.className = 'item-info';
+
+        const primary = document.createElement('div');
+        primary.className = 'item-primary';
+
+        const modelSpan = document.createElement('span');
+        modelSpan.className = 'key-text';
+        modelSpan.textContent = m;
+
+        primary.appendChild(modelSpan);
+        info.appendChild(primary);
+        item.appendChild(info);
+
+        container.appendChild(item);
+      }
+    }
+
+    function renderDisabledModels() {
+      const container = document.getElementById('disabledModelsContainer');
+      const hint = document.getElementById('disabledModelsHint');
+      const clearBtn = document.getElementById('clearDisabledModelsBtn');
+      if (!container || !hint) return;
+
+      const map = (disabledModelsState && typeof disabledModelsState === 'object')
+        ? disabledModelsState
+        : {};
+
+      const entries = [];
+      for (const [model, entry] of Object.entries(map)) {
+        const name = String(model || '').trim();
+        if (!name) continue;
+        const disabledAt = entry && entry.disabledAt ? Number(entry.disabledAt) : 0;
+        const reason = entry && entry.reason ? String(entry.reason) : '';
+        entries.push({ model: name, disabledAt, reason });
+      }
+
+      entries.sort((a, b) => (b.disabledAt - a.disabledAt) || a.model.localeCompare(b.model));
+
+      const days = disabledModelRetentionMs
+        ? Math.max(1, Math.round(Number(disabledModelRetentionMs) / (24 * 60 * 60 * 1000)))
+        : 0;
+
+      hint.textContent = entries.length === 0
+        ? ('暂无禁用模型' + (days ? ('；保留期：' + String(days) + ' 天') : ''))
+        : ('已禁用：' + String(entries.length) + (days ? ('；保留期：' + String(days) + ' 天') : ''));
+
+      if (clearBtn) {
+        clearBtn.disabled = entries.length === 0;
+      }
+
+      container.textContent = '';
+
+      if (entries.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        empty.textContent = '没有禁用模型';
+        container.appendChild(empty);
+        return;
+      }
+
+      for (const e of entries) {
+        const item = document.createElement('div');
+        item.className = 'list-item';
+
+        const info = document.createElement('div');
+        info.className = 'item-info';
+
+        const primary = document.createElement('div');
+        primary.className = 'item-primary';
+
+        const modelSpan = document.createElement('span');
+        modelSpan.className = 'key-text';
+        modelSpan.textContent = e.model;
+
+        const badge = document.createElement('span');
+        badge.className = 'status-badge status-invalid';
+        badge.textContent = 'disabled';
+
+        primary.appendChild(modelSpan);
+        primary.appendChild(badge);
+
+        const secondary = document.createElement('div');
+        secondary.className = 'item-secondary';
+        const timeText = e.disabledAt ? formatTimestamp(e.disabledAt) : '';
+        secondary.textContent = (timeText ? ('禁用时间：' + timeText) : '');
+        if (e.reason) {
+          secondary.textContent = secondary.textContent
+            ? (secondary.textContent + ' · ' + '原因：' + e.reason)
+            : ('原因：' + e.reason);
+        }
+
+        info.appendChild(primary);
+        if (secondary.textContent) info.appendChild(secondary);
+        item.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+
+        const restoreBtn = document.createElement('button');
+        restoreBtn.className = 'btn btn-success';
+        restoreBtn.textContent = '恢复';
+        restoreBtn.addEventListener('click', () => restoreDisabledModel(e.model));
+
+        actions.appendChild(restoreBtn);
+        item.appendChild(actions);
+
+        container.appendChild(item);
+      }
+    }
+
+    async function restoreDisabledModel(model) {
+      const name = String(model || '').trim();
+      if (!name) return;
+
+      try {
+        const res = await fetch('/api/models/disabled/' + encodeURIComponent(name), {
+          method: 'DELETE',
+          headers: getAuthHeaders(),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '恢复失败', 'error');
+          return;
+        }
+        showNotification('已恢复：' + name);
+        loadModels();
+      } catch (e) {
+        showNotification('恢复失败: ' + formatClientError(e), 'error');
+      }
+    }
+
+    async function clearDisabledModels() {
+      if (!confirm('清空禁用列表？之后被禁用的模型将允许再次参与轮询。')) return;
+
+      const btn = document.getElementById('clearDisabledModelsBtn');
+      setButtonLoading(btn, true, '清空中...');
+
+      try {
+        const res = await fetch('/api/models/disabled', {
+          method: 'DELETE',
+          headers: getAuthHeaders(),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (handleUnauthorized(res)) return;
+        if (!res.ok) {
+          showNotification(getApiErrorMessage(res, data) || '清空失败', 'error');
+          return;
+        }
+        showNotification('已清空禁用列表');
+        loadModels();
+      } catch (e) {
+        showNotification('清空失败: ' + formatClientError(e), 'error');
+      } finally {
+        setButtonLoading(btn, false);
+      }
+    }
+
     function renderModelCatalog() {
       const container = document.getElementById('modelCatalogContainer');
       const hint = document.getElementById('modelCatalogHint');
@@ -2557,6 +3076,10 @@ async function handler(req: Request): Promise<Response> {
 
       const pool = Array.isArray(currentModelPool) ? currentModelPool.map(m => String(m)) : [];
       const poolSet = new Set(pool);
+
+      const disabled = (disabledModelsState && typeof disabledModelsState === 'object')
+        ? disabledModelsState
+        : {};
 
       const catalogModels = (modelCatalogState && Array.isArray(modelCatalogState.models))
         ? modelCatalogState.models.map(m => String(m))
@@ -2604,6 +3127,17 @@ async function handler(req: Request): Promise<Response> {
 
         primary.appendChild(checkbox);
         primary.appendChild(modelSpan);
+
+        const disabledEntry = disabled && typeof disabled === 'object' ? disabled[name] : null;
+        if (disabledEntry) {
+          const badge = document.createElement('span');
+          badge.className = 'status-badge status-invalid';
+          badge.textContent = '已禁用';
+          const reason = disabledEntry.reason ? String(disabledEntry.reason) : '';
+          const disabledAt = disabledEntry.disabledAt ? formatTimestamp(disabledEntry.disabledAt) : '';
+          badge.title = (disabledAt ? ('禁用时间：' + disabledAt + '；') : '') + (reason ? ('原因：' + reason) : '');
+          primary.appendChild(badge);
+        }
 
         if (badgeText) {
           const badge = document.createElement('span');
@@ -2739,12 +3273,18 @@ async function handler(req: Request): Promise<Response> {
         }
 
         currentModelPool = Array.isArray(data.models) ? data.models.map(m => String(m)) : [];
+        effectiveModelPool = Array.isArray(data.effectiveModels) ? data.effectiveModels.map(m => String(m)) : [];
+        disabledModelsState = (data.disabledModels && typeof data.disabledModels === 'object') ? data.disabledModels : {};
+        disabledModelRetentionMs = Number(data.disabledModelRetentionMs || 0);
 
         const container = document.getElementById('modelsContainer');
         if (data.models?.length > 0) {
           container.textContent = '';
 
           for (const m of data.models) {
+            const name = String(m ?? '').trim();
+            if (!name) continue;
+
             const item = document.createElement('div');
             item.className = 'list-item';
 
@@ -2753,14 +3293,32 @@ async function handler(req: Request): Promise<Response> {
 
             const primary = document.createElement('div');
             primary.className = 'item-primary';
-            primary.textContent = String(m ?? '');
+
+            const modelSpan = document.createElement('span');
+            modelSpan.className = 'key-text';
+            modelSpan.textContent = name;
+
+            primary.appendChild(modelSpan);
+
+            const disabledEntry = disabledModelsState && typeof disabledModelsState === 'object'
+              ? disabledModelsState[name]
+              : null;
+            if (disabledEntry) {
+              const badge = document.createElement('span');
+              badge.className = 'status-badge status-invalid';
+              badge.textContent = 'disabled';
+              const reason = disabledEntry.reason ? String(disabledEntry.reason) : '';
+              const disabledAt = disabledEntry.disabledAt ? formatTimestamp(disabledEntry.disabledAt) : '';
+              badge.title = (disabledAt ? ('禁用时间：' + disabledAt + '；') : '') + (reason ? ('原因：' + reason) : '');
+              primary.appendChild(badge);
+            }
 
             info.appendChild(primary);
 
             const actions = document.createElement('div');
             actions.className = 'item-actions';
 
-            const encodedName = encodeURIComponent(m);
+            const encodedName = encodeURIComponent(name);
 
             const testBtn = document.createElement('button');
             testBtn.className = 'btn btn-success';
@@ -2788,6 +3346,8 @@ async function handler(req: Request): Promise<Response> {
           container.appendChild(empty);
         }
 
+        renderEffectiveModels();
+        renderDisabledModels();
         renderModelCatalog();
       } catch (e) {
         showNotification('加载失败: ' + formatClientError(e), 'error');

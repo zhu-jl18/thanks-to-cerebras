@@ -37,6 +37,23 @@ async function persistLegacyApiKey(
   });
 }
 
+async function encryptApiKeyWithSecret(
+  plaintext: string,
+  secret: string,
+): Promise<string> {
+  const previousSecret = Deno.env.get("KEY_ENCRYPTION_SECRET");
+  Deno.env.set("KEY_ENCRYPTION_SECRET", secret);
+  try {
+    return await encryptApiKey(plaintext);
+  } finally {
+    if (previousSecret === undefined) {
+      Deno.env.delete("KEY_ENCRYPTION_SECRET");
+    } else {
+      Deno.env.set("KEY_ENCRYPTION_SECRET", previousSecret);
+    }
+  }
+}
+
 async function seedPreExistingDuplicate(
   plaintext: string,
 ): Promise<readonly [string, string]> {
@@ -108,6 +125,67 @@ Deno.test(
       const add = await kvAddKey(plaintext);
       assertEquals(add, { success: false, error: "密钥已存在" });
       assertEquals(await countApiKeyRecords(), 1);
+    } finally {
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
+  "kvDeleteKey: unreadable survivor blocks removal of the only value index",
+  async () => {
+    const kv = await openIsolatedKv();
+    try {
+      const plaintext = "sk-unreadable-duplicate";
+      const ids = await seedPreExistingDuplicate(plaintext);
+      const owner = await getValueIndexOwner(plaintext);
+      if (owner === null) {
+        throw new Error("backfill did not create an index");
+      }
+      const survivor = findSurvivor(ids, owner);
+      const survivorKey = [...API_KEY_PREFIX, survivor];
+      const survivorEntry = await state.kv.get<Record<string, unknown>>(
+        survivorKey,
+      );
+      if (survivorEntry.value === null) {
+        throw new Error("expected surviving duplicate record");
+      }
+
+      // The record still represents the same plaintext, but its ciphertext was
+      // produced with another secret and cannot be decrypted by this instance.
+      const unreadableCiphertext = await encryptApiKeyWithSecret(
+        plaintext,
+        "different-key-encryption-secret",
+      );
+      await state.kv.set(survivorKey, {
+        ...survivorEntry.value,
+        encryptedKey: unreadableCiphertext,
+      });
+
+      const deleted = await kvDeleteKey(owner);
+      assertEquals(deleted, {
+        success: false,
+        error: "密钥删除失败，请重试",
+      });
+
+      // The scan could not prove the survivor unrelated, so both the owner and
+      // its index remain. A stale-cache add is still rejected authoritatively.
+      assertEquals(
+        (await state.kv.get([...API_KEY_PREFIX, owner])).value !== null,
+        true,
+      );
+      assertEquals(
+        (await state.kv.get([...API_KEY_PREFIX, survivor])).value !== null,
+        true,
+      );
+      assertEquals(await getValueIndexOwner(plaintext), owner);
+
+      state.cachedKeysById.clear();
+      state.cachedActiveKeyIds = [];
+      const add = await kvAddKey(plaintext);
+      assertEquals(add, { success: false, error: "密钥已存在" });
+      assertEquals(await countApiKeyRecords(), 2);
     } finally {
       setLogSinkForTests(null);
       kv.close();

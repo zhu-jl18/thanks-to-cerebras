@@ -24,7 +24,10 @@ async function openIsolatedKv(): Promise<Deno.Kv> {
   return kv;
 }
 
-async function persistLegacyApiKey(id: string, plaintext: string): Promise<void> {
+async function persistLegacyApiKey(
+  id: string,
+  plaintext: string,
+): Promise<void> {
   await state.kv.set([...API_KEY_PREFIX, id], {
     id,
     encryptedKey: await encryptApiKey(plaintext),
@@ -80,7 +83,9 @@ Deno.test(
       const plaintext = "sk-pre-existing-duplicate";
       const ids = await seedPreExistingDuplicate(plaintext);
       const owner = await getValueIndexOwner(plaintext);
-      if (owner === null) throw new Error("backfill did not create an index");
+      if (owner === null) {
+        throw new Error("backfill did not create an index");
+      }
       const survivor = findSurvivor(ids, owner);
 
       const deleted = await kvDeleteKey(owner);
@@ -118,7 +123,9 @@ Deno.test(
       const plaintext = "sk-concurrent-survivor-delete";
       const ids = await seedPreExistingDuplicate(plaintext);
       const owner = await getValueIndexOwner(plaintext);
-      if (owner === null) throw new Error("backfill did not create an index");
+      if (owner === null) {
+        throw new Error("backfill did not create an index");
+      }
       const survivor = findSurvivor(ids, owner);
 
       const originalAtomic = state.kv.atomic.bind(state.kv);

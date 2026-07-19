@@ -1,3 +1,2 @@
 [0m[32mTask[0m [0m[36mcomplexity:check[0m deno run --allow-read scripts/complexity-check.ts --max 22
-Complexity check failed. Maximum allowed complexity is 22.
-- src/services/proxy.ts:146 forwardChatCompletion complexity=23
+Complexity check passed: 248 functions, max 21 (src/proxy-validation.ts:109 validateChatRequest), threshold 22.

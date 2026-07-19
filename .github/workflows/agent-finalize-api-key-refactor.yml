@@ -30,8 +30,8 @@ jobs:
         run: deno fmt main.ts src scripts/*.ts
       - name: Remove one-shot finalizer
         run: |
-          git rm scripts/agent-finalize-api-key-refactor.ts
-          git rm .github/workflows/agent-finalize-api-key-refactor.yml
+          rm -f scripts/agent-finalize-api-key-refactor.ts
+          rm -f .github/workflows/agent-finalize-api-key-refactor.yml
       - name: Verify patch hygiene
         run: git diff --check
       - name: Commit finalized tree

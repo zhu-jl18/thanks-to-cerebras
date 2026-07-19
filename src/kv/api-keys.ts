@@ -200,6 +200,18 @@ export async function kvDeleteKey(
     kvPlanApiKeyValueIndexRelease(id, plaintext),
     state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
   ]);
+  if (indexPlan.action === "blocked") {
+    // Removing the owner would erase the only known protection while an
+    // unreadable record might still contain the same plaintext. Abort without
+    // mutating either the owner or the index; a later retry can succeed after
+    // the candidate is repaired, migrated, or removed.
+    logger.warn("api_key_value_index_release_blocked", {
+      keyId: id,
+      candidateId: indexPlan.candidateId,
+    });
+    return { success: false, error: "密钥删除失败，请重试" };
+  }
+
   const revision = getNextRevisionValue(revisionEntry);
 
   // Always CAS the index snapshot, including a missing legacy entry or an

@@ -1,4 +1,3 @@
 [0m[32mTask[0m [0m[36mlarge-files:check[0m deno run --allow-read scripts/large-file-check.ts
 Large file check failed.
-- src/kv/api-key-store.ts: 332/300 lines, 10318/20000 bytes
 - src/services/proxy.ts: 319/300 lines, 9891/20000 bytes

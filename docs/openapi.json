@@ -281,18 +281,6 @@
         }
       }
     },
-    "/api/keys/migrate": {
-      "post": {
-        "tags": ["Admin keys"],
-        "operationId": "migrateApiKeys",
-        "summary": "Migrate stored Cerebras API keys to encrypted storage",
-        "security": [{ "AdminToken": [] }],
-        "responses": {
-          "200": { "$ref": "#/components/responses/Migrated" },
-          "401": { "$ref": "#/components/responses/Problem" }
-        }
-      }
-    },
     "/api/keys/export": {
       "get": {
         "tags": ["Admin keys"],
@@ -311,9 +299,10 @@
         "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
         "responses": {
           "200": { "$ref": "#/components/responses/Success" },
-          "400": { "$ref": "#/components/responses/Problem" },
           "401": { "$ref": "#/components/responses/Problem" },
-          "404": { "$ref": "#/components/responses/Problem" }
+          "404": { "$ref": "#/components/responses/Problem" },
+          "409": { "$ref": "#/components/responses/Problem" },
+          "500": { "$ref": "#/components/responses/Problem" }
         }
       }
     },

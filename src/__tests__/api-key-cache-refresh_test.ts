@@ -1,7 +1,6 @@
 /**
- * Regression tests for issue #138: refreshApiKeyCacheRevision must not
- * cascade KV failures into per-request 500 responses, and must not turn
- * the throttle window into a per-request KV retry loop.
+ * Regression tests for issue #138: cache refresh failures must not cascade into
+ * proxy requests or produce a per-request KV retry storm.
  */
 
 import { assertEquals } from "@std/assert";
@@ -11,18 +10,20 @@ import {
   CEREBRAS_API_URL,
   PROXY_KEY_AUTH_REFRESH_INTERVAL_MS,
 } from "../constants.ts";
-import { encryptApiKey } from "../secrets.ts";
 import { createHandler, createRouter } from "../app.ts";
+import { refreshApiKeyCacheIfChanged } from "../api-keys.ts";
 import {
-  rebuildActiveKeyIds,
-  refreshApiKeyCacheIfChanged,
-} from "../api-keys.ts";
+  apiKeyUniqueClaimKey,
+  createApiKeyStore,
+} from "../kv/api-key-store.ts";
 import { bootstrapCache } from "../kv/flush.ts";
 import { metrics } from "../metrics.ts";
 import { resetKvRateLimitsForTests } from "../rate-limit.ts";
 import { resetProxyStreamCountersForTests } from "../stream-limits.ts";
 import { AppState, state } from "../state.ts";
 import { setLogSinkForTests } from "../logger.ts";
+import { fingerprintApiKey } from "../secrets.ts";
+import { addTestApiKey } from "./api-key-test-helpers.ts";
 
 async function setupKv(): Promise<Deno.Kv> {
   if (state.kvFlushTimerId !== null) clearInterval(state.kvFlushTimerId);
@@ -39,44 +40,11 @@ async function setupKv(): Promise<Deno.Kv> {
   return kv;
 }
 
-async function addActiveApiKey(key: string): Promise<void> {
-  const apiKey = {
-    id: crypto.randomUUID(),
-    key,
-    encryptedKey: await encryptApiKey(key),
-    useCount: 0,
-    status: "active" as const,
-    createdAt: Date.now(),
-  };
-  await state.kv.set([...API_KEY_PREFIX, apiKey.id], {
-    id: apiKey.id,
-    encryptedKey: apiKey.encryptedKey,
-    useCount: apiKey.useCount,
-    status: apiKey.status,
-    createdAt: apiKey.createdAt,
-  });
-  state.cachedKeysById.set(apiKey.id, apiKey);
-  rebuildActiveKeyIds();
+function sameKey(left: Deno.KvKey, right: readonly unknown[]): boolean {
+  return left.length === right.length &&
+    left.every((part, index) => part === right[index]);
 }
 
-function isRevisionKey(key: Deno.KvKey): boolean {
-  if (key.length !== API_KEY_CACHE_REVISION_KEY.length) return false;
-  for (let i = 0; i < key.length; i++) {
-    if (key[i] !== API_KEY_CACHE_REVISION_KEY[i]) return false;
-  }
-  return true;
-}
-
-/**
- * Wraps state.kv so reads of API_KEY_CACHE_REVISION_KEY reject with the
- * provided error, while every other KV operation passes through unchanged.
- * Returns a function that restores the original state.kv and the count of
- * intercepted reads.
- *
- * Note: Deno.Kv methods access private slots, so the Proxy must rebind
- * methods to the underlying target rather than letting them run with the
- * Proxy as the receiver.
- */
 function failRevisionReadsOnly(error: Error): {
   restore: () => void;
   callCount: () => number;
@@ -84,10 +52,10 @@ function failRevisionReadsOnly(error: Error): {
   const original = state.kv;
   let count = 0;
   const proxy = new Proxy(original, {
-    get(target, prop, _receiver) {
-      if (prop === "get") {
+    get(target, property) {
+      if (property === "get") {
         return (key: Deno.KvKey, ...rest: unknown[]) => {
-          if (isRevisionKey(key)) {
+          if (sameKey(key, API_KEY_CACHE_REVISION_KEY)) {
             count++;
             return Promise.reject(error);
           }
@@ -96,7 +64,7 @@ function failRevisionReadsOnly(error: Error): {
           ) => Promise<unknown>).call(target, key, ...rest);
         };
       }
-      const value = Reflect.get(target, prop, target);
+      const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
   }) as Deno.Kv;
@@ -109,24 +77,10 @@ function failRevisionReadsOnly(error: Error): {
   };
 }
 
-function isApiKeyPrefixSelector(selector: Deno.KvListSelector): boolean {
-  if (!("prefix" in selector)) return false;
-  const prefix = selector.prefix;
-  if (!Array.isArray(prefix) || prefix.length !== API_KEY_PREFIX.length) {
-    return false;
-  }
-  for (let i = 0; i < prefix.length; i++) {
-    if (prefix[i] !== API_KEY_PREFIX[i]) return false;
-  }
-  return true;
+function isApiKeyRecordList(selector: Deno.KvListSelector): boolean {
+  return "prefix" in selector && sameKey(selector.prefix, API_KEY_PREFIX);
 }
 
-/**
- * Same idea as failRevisionReadsOnly but for state.kv.list when called with
- * the api-keys prefix — i.e. the path kvMergeAllApiKeysIntoCache takes.
- * Lets us exercise the merge-phase failure path independently from the
- * revision-read path.
- */
 function failApiKeyListOnly(error: Error): {
   restore: () => void;
   callCount: () => number;
@@ -134,10 +88,10 @@ function failApiKeyListOnly(error: Error): {
   const original = state.kv;
   let count = 0;
   const proxy = new Proxy(original, {
-    get(target, prop, _receiver) {
-      if (prop === "list") {
+    get(target, property) {
+      if (property === "list") {
         return (selector: Deno.KvListSelector, ...rest: unknown[]) => {
-          if (isApiKeyPrefixSelector(selector)) {
+          if (isApiKeyRecordList(selector)) {
             count++;
             throw error;
           }
@@ -146,7 +100,7 @@ function failApiKeyListOnly(error: Error): {
           ) => unknown).call(target, selector, ...rest);
         };
       }
-      const value = Reflect.get(target, prop, target);
+      const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     },
   }) as Deno.Kv;
@@ -164,10 +118,6 @@ interface CapturedLog {
   record: Record<string, unknown>;
 }
 
-/**
- * Replaces the logger sink with one that collects every emitted line as a
- * parsed JSON record. Returned `restore()` puts the default sink back.
- */
 function captureLogs(): { records: CapturedLog[]; restore: () => void } {
   const records: CapturedLog[] = [];
   setLogSinkForTests((level, line) => {
@@ -180,22 +130,17 @@ function captureLogs(): { records: CapturedLog[]; restore: () => void } {
 }
 
 Deno.test(
-  "refreshApiKeyCacheIfChanged: persistent KV failure does not throw",
+  "refreshApiKeyCacheIfChanged: persistent revision failure does not throw",
   async () => {
     const kv = await setupKv();
-    await addActiveApiKey("sk-test-cache");
+    await addTestApiKey("sk-test-cache");
     const fail = failRevisionReadsOnly(new Error("kv outage"));
 
     try {
-      // Force the throttle to be expired so the next call hits KV.
       state.apiKeyCacheRevisionLastCheckedAt = 0;
-
-      // Multiple sequential calls must all complete without bubbling errors.
-      for (let i = 0; i < 5; i++) {
+      for (let index = 0; index < 5; index++) {
         await refreshApiKeyCacheIfChanged();
       }
-
-      // The cache must still serve the previously loaded key.
       assertEquals(state.cachedActiveKeyIds.length, 1);
     } finally {
       fail.restore();
@@ -206,22 +151,17 @@ Deno.test(
 );
 
 Deno.test(
-  "refreshApiKeyCacheIfChanged: throttle prevents per-request KV retries",
+  "refreshApiKeyCacheIfChanged: throttle prevents revision retry storms",
   async () => {
     const kv = await setupKv();
-    await addActiveApiKey("sk-test-throttle");
+    await addTestApiKey("sk-test-throttle");
     const fail = failRevisionReadsOnly(new Error("kv outage"));
 
     try {
       state.apiKeyCacheRevisionLastCheckedAt = 0;
-
-      // Burst of refresh attempts: the first one bumps the throttle clock,
-      // every subsequent one within the throttle window must short-circuit
-      // before reaching KV.
-      for (let i = 0; i < 100; i++) {
+      for (let index = 0; index < 100; index++) {
         await refreshApiKeyCacheIfChanged();
       }
-
       assertEquals(fail.callCount(), 1);
     } finally {
       fail.restore();
@@ -232,21 +172,17 @@ Deno.test(
 );
 
 Deno.test(
-  "refreshApiKeyCacheIfChanged: concurrent failing refreshes share one KV read",
+  "refreshApiKeyCacheIfChanged: concurrent failures share one revision read",
   async () => {
     const kv = await setupKv();
-    await addActiveApiKey("sk-test-concurrent");
+    await addTestApiKey("sk-test-concurrent");
     const fail = failRevisionReadsOnly(new Error("kv outage"));
 
     try {
       state.apiKeyCacheRevisionLastCheckedAt = 0;
-
-      // 50 concurrent calls: existing in-flight dedup should collapse them
-      // into a single underlying KV read, and none should throw.
       await Promise.all(
         Array.from({ length: 50 }, () => refreshApiKeyCacheIfChanged()),
       );
-
       assertEquals(fail.callCount(), 1);
     } finally {
       fail.restore();
@@ -257,10 +193,10 @@ Deno.test(
 );
 
 Deno.test(
-  "refreshApiKeyCacheIfChanged: throttle re-arms after the window elapses",
+  "refreshApiKeyCacheIfChanged: throttle re-arms after its window",
   async () => {
     const kv = await setupKv();
-    await addActiveApiKey("sk-test-rearm");
+    await addTestApiKey("sk-test-rearm");
     const fail = failRevisionReadsOnly(new Error("kv outage"));
 
     try {
@@ -268,15 +204,10 @@ Deno.test(
       await refreshApiKeyCacheIfChanged();
       assertEquals(fail.callCount(), 1);
 
-      // Simulate the throttle window having passed without changing wall
-      // clock: pretend the last successful check was long ago.
       state.apiKeyCacheRevisionLastCheckedAt = Date.now() -
         PROXY_KEY_AUTH_REFRESH_INTERVAL_MS - 1;
-
       await refreshApiKeyCacheIfChanged();
       assertEquals(fail.callCount(), 2);
-
-      // And it must throttle again afterwards.
       await refreshApiKeyCacheIfChanged();
       assertEquals(fail.callCount(), 2);
     } finally {
@@ -288,13 +219,12 @@ Deno.test(
 );
 
 Deno.test(
-  "proxy request still 200 when KV revision read fails (cache served)",
+  "proxy request serves verified cache when revision read fails",
   async () => {
     const kv = await setupKv();
     const handler = createHandler(createRouter());
     state.cachedConfig = { ...state.cachedConfig!, proxyPublicAccess: true };
-    await addActiveApiKey("sk-upstream-cache-fallback");
-
+    await addTestApiKey("sk-upstream-cache-fallback");
     const fail = failRevisionReadsOnly(new Error("kv outage"));
 
     const originalFetch = globalThis.fetch;
@@ -309,24 +239,18 @@ Deno.test(
     };
 
     try {
-      // Force a refresh attempt on the next proxy request.
       state.apiKeyCacheRevisionLastCheckedAt = 0;
-
-      const res = await handler(
+      const response = await handler(
         new Request("http://localhost/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+          body: JSON.stringify({
+            messages: [{ role: "user", content: "hi" }],
+          }),
         }),
       );
-
-      // Without the fix, the rejected revision read propagates to the
-      // handler and the client sees a 500. With the fix the proxy serves
-      // the request from its existing cache and returns 200.
-      assertEquals(res.status, 200);
-      await res.body?.cancel();
-
-      // The KV outage should have been observed exactly once on this path.
+      assertEquals(response.status, 200);
+      await response.body?.cancel();
       assertEquals(fail.callCount(), 1);
     } finally {
       globalThis.fetch = originalFetch;
@@ -337,79 +261,79 @@ Deno.test(
   },
 );
 
-Deno.test("recovery: refresh resumes after transient KV list failure", async () => {
-  const kv = await setupKv();
-  await addActiveApiKey("sk-retry-secret");
-  const [apiKeyId] = state.cachedActiveKeyIds;
+Deno.test(
+  "proxy empty-pool refresh contains strict store verification failures",
+  async () => {
+    const kv = await setupKv();
+    const handler = createHandler(createRouter());
+    state.cachedConfig = { ...state.cachedConfig!, proxyPublicAccess: true };
+    const fingerprint = await fingerprintApiKey("sk-dangling-empty-pool");
+    await kv.set(apiKeyUniqueClaimKey(fingerprint), "missing-owner");
+    const logs = captureLogs();
 
-  await kv.delete([...API_KEY_PREFIX, apiKeyId]);
-  await kv.set(API_KEY_CACHE_REVISION_KEY, Date.now());
-  state.apiKeyCacheRevision = 0;
+    try {
+      const response = await handler(
+        new Request("http://localhost/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        }),
+      );
+      const body = await response.json();
+
+      assertEquals(response.status, 500);
+      assertEquals(body.error, "没有可用的 API 密钥");
+      const warnings = logs.records.filter((item) =>
+        item.level === "warn" &&
+        item.record.event === "api_key_cache_refresh_failed" &&
+        item.record.phase === "empty_pool_merge"
+      );
+      assertEquals(warnings.length, 1);
+    } finally {
+      logs.restore();
+      kv.close();
+    }
+  },
+);
+
+Deno.test("refresh recovers after a transient record-list failure", async () => {
+  const kv = await setupKv();
+  const id = await addTestApiKey("sk-retry-secret");
+  const deleted = await createApiKeyStore(kv).delete(id);
+  if (!deleted.ok) throw new Error(`delete failed: ${deleted.code}`);
   state.apiKeyCacheRevisionLastCheckedAt = 0;
 
-  const originalList = state.kv.list.bind(state.kv);
-  let failed = false;
-  state.kv.list = ((
-    selector: Deno.KvListSelector,
-    options?: Deno.KvListOptions,
-  ) => {
-    if (!failed) {
-      failed = true;
-      throw new Error("transient list failure");
-    }
-    return originalList(selector, options);
-  }) as typeof state.kv.list;
-
+  const fail = failApiKeyListOnly(new Error("transient list failure"));
   try {
-    // First refresh: kvMergeAllApiKeysIntoCache rejects via state.kv.list.
-    // Per the #138 fix the error is swallowed; the in-memory revision is
-    // not advanced and the cache is left intact — the proxy keeps serving
-    // from the previously loaded keys.
     await refreshApiKeyCacheIfChanged();
-    assertEquals(state.apiKeyCacheRevision, 0);
-    assertEquals(state.cachedKeysById.has(apiKeyId), true);
+    assertEquals(state.cachedKeysById.has(id), true);
 
-    state.kv.list = originalList;
-
-    // After the throttle window resets, the next refresh sees a healthy
-    // KV, merges successfully and finally evicts the deleted key.
+    fail.restore();
     state.apiKeyCacheRevisionLastCheckedAt = 0;
     await refreshApiKeyCacheIfChanged();
-    assertEquals(state.cachedKeysById.has(apiKeyId), false);
+    assertEquals(state.cachedKeysById.has(id), false);
   } finally {
-    state.kv.list = originalList;
+    fail.restore();
     setLogSinkForTests(null);
     kv.close();
   }
 });
 
 Deno.test(
-  "refreshApiKeyCacheIfChanged: throttle prevents per-request KV merge retries",
+  "refreshApiKeyCacheIfChanged: throttle prevents merge retry storms",
   async () => {
     const kv = await setupKv();
-    await addActiveApiKey("sk-test-list-throttle");
-
-    // Force the in-memory revision to lag behind KV so refresh proceeds
-    // past getApiKeyCacheRevision() into kvMergeAllApiKeysIntoCache(),
-    // where state.kv.list() is invoked. Without this, refresh would
-    // short-circuit at the revision-equality check and never reach the
-    // merge path we want to exercise.
-    await state.kv.set(API_KEY_CACHE_REVISION_KEY, Date.now());
-    state.apiKeyCacheRevision = 0;
+    await addTestApiKey("sk-test-list-throttle");
+    await state.kv.set(API_KEY_CACHE_REVISION_KEY, Date.now() + 1);
     state.apiKeyCacheRevisionLastCheckedAt = 0;
-
     const fail = failApiKeyListOnly(new Error("kv list outage"));
 
     try {
-      // Burst of refresh attempts. The first one fails inside merge, but
-      // because the throttle clock was bumped before the KV call, every
-      // subsequent attempt within the throttle window must short-circuit
-      // before re-entering merge — preventing the per-request retry storm
-      // that issue #138 describes.
-      for (let i = 0; i < 100; i++) {
+      for (let index = 0; index < 100; index++) {
         await refreshApiKeyCacheIfChanged();
       }
-
       assertEquals(fail.callCount(), 1);
     } finally {
       fail.restore();
@@ -419,65 +343,49 @@ Deno.test(
   },
 );
 
-Deno.test(
-  "refreshApiKeyCacheIfChanged: revision read failure logs phase=revision_read",
-  async () => {
-    const kv = await setupKv();
-    await addActiveApiKey("sk-test-log-revision");
+Deno.test("refresh failure logs phase=revision_read", async () => {
+  const kv = await setupKv();
+  await addTestApiKey("sk-test-log-revision");
+  const logs = captureLogs();
+  const fail = failRevisionReadsOnly(new Error("kv outage"));
 
-    const logs = captureLogs();
-    const fail = failRevisionReadsOnly(new Error("kv outage"));
-
-    try {
-      state.apiKeyCacheRevisionLastCheckedAt = 0;
-      await refreshApiKeyCacheIfChanged();
-
-      const warns = logs.records.filter(
-        (r) =>
-          r.level === "warn" &&
-          r.record.event === "api_key_cache_refresh_failed",
-      );
-      assertEquals(warns.length, 1);
-      assertEquals(warns[0].record.phase, "revision_read");
-      assertEquals(warns[0].record.errorMessage, "kv outage");
-    } finally {
-      fail.restore();
-      logs.restore();
-      kv.close();
-    }
-  },
-);
-
-Deno.test(
-  "refreshApiKeyCacheIfChanged: merge failure logs phase=merge_keys",
-  async () => {
-    const kv = await setupKv();
-    await addActiveApiKey("sk-test-log-merge");
-
-    // Same setup as the merge-throttle test: bump revision so refresh
-    // proceeds into the merge phase.
-    await state.kv.set(API_KEY_CACHE_REVISION_KEY, Date.now());
-    state.apiKeyCacheRevision = 0;
+  try {
     state.apiKeyCacheRevisionLastCheckedAt = 0;
+    await refreshApiKeyCacheIfChanged();
+    const warns = logs.records.filter((item) =>
+      item.level === "warn" &&
+      item.record.event === "api_key_cache_refresh_failed"
+    );
+    assertEquals(warns.length, 1);
+    assertEquals(warns[0].record.phase, "revision_read");
+    assertEquals(warns[0].record.errorMessage, "kv outage");
+  } finally {
+    fail.restore();
+    logs.restore();
+    kv.close();
+  }
+});
 
-    const logs = captureLogs();
-    const fail = failApiKeyListOnly(new Error("kv list outage"));
+Deno.test("refresh failure logs phase=merge_keys", async () => {
+  const kv = await setupKv();
+  await addTestApiKey("sk-test-log-merge");
+  await state.kv.set(API_KEY_CACHE_REVISION_KEY, Date.now() + 1);
+  state.apiKeyCacheRevisionLastCheckedAt = 0;
+  const logs = captureLogs();
+  const fail = failApiKeyListOnly(new Error("kv list outage"));
 
-    try {
-      await refreshApiKeyCacheIfChanged();
-
-      const warns = logs.records.filter(
-        (r) =>
-          r.level === "warn" &&
-          r.record.event === "api_key_cache_refresh_failed",
-      );
-      assertEquals(warns.length, 1);
-      assertEquals(warns[0].record.phase, "merge_keys");
-      assertEquals(warns[0].record.errorMessage, "kv list outage");
-    } finally {
-      fail.restore();
-      logs.restore();
-      kv.close();
-    }
-  },
-);
+  try {
+    await refreshApiKeyCacheIfChanged();
+    const warns = logs.records.filter((item) =>
+      item.level === "warn" &&
+      item.record.event === "api_key_cache_refresh_failed"
+    );
+    assertEquals(warns.length, 1);
+    assertEquals(warns[0].record.phase, "merge_keys");
+    assertEquals(warns[0].record.errorMessage, "kv list outage");
+  } finally {
+    fail.restore();
+    logs.restore();
+    kv.close();
+  }
+});

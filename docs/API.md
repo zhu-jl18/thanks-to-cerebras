@@ -120,20 +120,26 @@
 - `DELETE /api/proxy-keys/<id>`
 - `GET /api/proxy-keys/<id>/export`
   - 返回 `403`；代理密钥只在创建时显示一次
-
 - `POST /api/proxy-keys/migrate`
   - 将旧 KV 中明文 proxy key 迁移为 HMAC 哈希存储
 
 ### 4.2 Cerebras API 密钥（API Keys）
 
+API key 使用随机资源 ID 管理；明文经 AES-GCM 加密，另以部署作用域的 HMAC
+blind fingerprint 建立唯一 claim。主记录和 claim 在同一个 Deno KV atomic
+事务中创建或删除，因此多实例和 stale cache 场景下仍保持同值唯一性。
+
 - `GET /api/keys`
   - 返回：密钥元数据列表（不包含明文 key）
+  - 若 record/claim 存储 invariant 不成立，返回服务端错误而不是跳过损坏记录
 - `POST /api/keys`
   - 请求体：`{ "key": string }`
+  - 同值 key 已存在时返回 `409`
 - `POST /api/keys/batch`
   - Content-Type 支持：`application/json` 或纯文本
   - 返回：导入结果汇总（部分成功/失败）
 - `DELETE /api/keys/<id>`
+  - 删除主记录和唯一 claim；冲突返回 `409`，存储 invariant 损坏返回 `500`
 - `POST /api/keys/<id>/test`
   - 描述：测活单个 key（会访问上游）
   - 注意：该操作会更新 KV 内该 key 的 `status`
@@ -141,8 +147,9 @@
   - 返回 `403`；明文导出已禁用
 - `GET /api/keys/<id>/export`
   - 返回 `403`；明文导出已禁用
-- `POST /api/keys/migrate`
-  - 将旧 KV 中明文 Cerebras API key 迁移为加密存储
+
+当前 API-key store 不提供旧 schema 迁移端点。升级到该 schema 前需要清空旧 API-key
+记录并通过管理 API 重新导入，避免部分索引状态在运行时被静默接受。
 
 ### 4.3 模型池（Models）
 

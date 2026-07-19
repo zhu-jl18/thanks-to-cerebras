@@ -1,5 +1,15 @@
-const API_KEY_PREFIX = "v1$aes-gcm$";
+const API_KEY_CIPHERTEXT_PREFIX = "v1$aes-gcm$";
+const API_KEY_FINGERPRINT_PREFIX = "v1$api-key-hmac-sha256$";
 const PROXY_KEY_PREFIX = "v1$hmac-sha256$";
+const SHA256_BYTES = 32;
+
+const encoder = new TextEncoder();
+const API_KEY_FINGERPRINT_SALT = encoder.encode(
+  "thanks-to-cerebras/api-key-store",
+);
+const API_KEY_FINGERPRINT_INFO = encoder.encode(
+  "api-key-fingerprint/v1",
+);
 
 function encodeBase64Url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes))
@@ -23,12 +33,16 @@ function bytesSource(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(bytes);
 }
 
-function secretMaterial(): Uint8Array {
+function encryptionSecret(): string {
   const secret = Deno.env.get("KEY_ENCRYPTION_SECRET")?.trim();
   if (!secret) {
     throw new Error("KEY_ENCRYPTION_SECRET 未配置，禁止写入或读取密钥");
   }
-  return new TextEncoder().encode(secret);
+  return secret;
+}
+
+function secretMaterial(): Uint8Array {
+  return encoder.encode(encryptionSecret());
 }
 
 export function assertKeyEncryptionSecretConfigured(): void {
@@ -44,7 +58,7 @@ async function deriveAesKey(): Promise<CryptoKey> {
   ]);
 }
 
-function deriveHmacKey(): Promise<CryptoKey> {
+function deriveProxyHmacKey(): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
     bytesSource(secretMaterial()),
@@ -54,8 +68,73 @@ function deriveHmacKey(): Promise<CryptoKey> {
   );
 }
 
+interface ApiKeyFingerprintKeyCache {
+  secret: string;
+  keyPromise: Promise<CryptoKey>;
+}
+
+let apiKeyFingerprintKeyCache: ApiKeyFingerprintKeyCache | null = null;
+
+async function importApiKeyFingerprintKey(secret: string): Promise<CryptoKey> {
+  const rootKey = await crypto.subtle.importKey(
+    "raw",
+    bytesSource(encoder.encode(secret)),
+    "HKDF",
+    false,
+    ["deriveBits"],
+  );
+  const keyMaterial = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: bytesSource(API_KEY_FINGERPRINT_SALT),
+      info: bytesSource(API_KEY_FINGERPRINT_INFO),
+    },
+    rootKey,
+    SHA256_BYTES * 8,
+  );
+  return crypto.subtle.importKey(
+    "raw",
+    keyMaterial,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
+
+function deriveApiKeyFingerprintKey(): Promise<CryptoKey> {
+  const secret = encryptionSecret();
+  if (apiKeyFingerprintKeyCache?.secret === secret) {
+    return apiKeyFingerprintKeyCache.keyPromise;
+  }
+
+  const keyPromise = importApiKeyFingerprintKey(secret).catch((error) => {
+    if (apiKeyFingerprintKeyCache?.keyPromise === keyPromise) {
+      apiKeyFingerprintKeyCache = null;
+    }
+    throw error;
+  });
+  apiKeyFingerprintKeyCache = { secret, keyPromise };
+  return keyPromise;
+}
+
 export function isEncryptedApiKey(value: string): boolean {
-  return value.startsWith(API_KEY_PREFIX);
+  return value.startsWith(API_KEY_CIPHERTEXT_PREFIX);
+}
+
+export function isApiKeyFingerprint(value: string): boolean {
+  const parts = value.split("$");
+  if (
+    parts.length !== 3 || parts[0] !== "v1" ||
+    parts[1] !== "api-key-hmac-sha256"
+  ) {
+    return false;
+  }
+  try {
+    return decodeBase64Url(parts[2]).byteLength === SHA256_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 export function isHashedProxyKey(value: string): boolean {
@@ -86,17 +165,17 @@ export async function encryptApiKey(plaintext: string): Promise<string> {
     await crypto.subtle.encrypt(
       { name: "AES-GCM", iv },
       key,
-      bytesSource(new TextEncoder().encode(plaintext)),
+      bytesSource(encoder.encode(plaintext)),
     ),
   );
-  return `${API_KEY_PREFIX}${encodeBase64Url(iv)}$${
+  return `${API_KEY_CIPHERTEXT_PREFIX}${encodeBase64Url(iv)}$${
     encodeBase64Url(ciphertext)
   }`;
 }
 
 export async function decryptApiKey(stored: string): Promise<string> {
   if (!isEncryptedApiKey(stored)) {
-    throw new Error("API key 存储格式不兼容：需要先运行密钥迁移");
+    throw new Error("API key 存储格式不兼容：密文版本无效");
   }
 
   const parts = stored.split("$");
@@ -112,12 +191,29 @@ export async function decryptApiKey(stored: string): Promise<string> {
   return new TextDecoder().decode(plaintext);
 }
 
+/**
+ * Produces a deterministic, deployment-scoped blind index for API-key
+ * plaintext. The HMAC key is derived from the root secret with HKDF and a
+ * dedicated context, so the fingerprint cannot be used as a general-purpose
+ * hash or correlated across deployments with different secrets.
+ */
+export async function fingerprintApiKey(plaintext: string): Promise<string> {
+  const signature = new Uint8Array(
+    await crypto.subtle.sign(
+      "HMAC",
+      await deriveApiKeyFingerprintKey(),
+      bytesSource(encoder.encode(plaintext)),
+    ),
+  );
+  return `${API_KEY_FINGERPRINT_PREFIX}${encodeBase64Url(signature)}`;
+}
+
 async function hashProxyKeyBytes(secret: string): Promise<Uint8Array> {
   return new Uint8Array(
     await crypto.subtle.sign(
       "HMAC",
-      await deriveHmacKey(),
-      bytesSource(new TextEncoder().encode(secret)),
+      await deriveProxyHmacKey(),
+      bytesSource(encoder.encode(secret)),
     ),
   );
 }

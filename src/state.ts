@@ -52,6 +52,7 @@ export class AppState {
   apiKeyCacheRevision = 0;
   apiKeyCacheRevisionLastCheckedAt = 0;
   apiKeyCacheRevisionRefreshInFlight: Promise<void> | null = null;
+  apiKeyEmptyPoolRefreshLastAttemptAt = 0;
 
   addPendingTotalRequests(delta: number): void {
     if (!Number.isFinite(delta) || delta <= 0) return;

@@ -5,8 +5,8 @@
 //   totalRequests. These are batched via a periodic timer to avoid
 //   per-request KV overhead on the proxy critical path.
 
-import type { ApiKey, ProxyAuthKey, ProxyConfig } from "../types.ts";
-import { API_KEY_PREFIX, PROXY_KEY_PREFIX } from "../constants.ts";
+import type { ProxyAuthKey, ProxyConfig } from "../types.ts";
+import { PROXY_KEY_PREFIX } from "../constants.ts";
 import { rebuildActiveKeyIds } from "../api-keys.ts";
 import { rebuildModelPoolCache } from "../models.ts";
 import { state } from "../state.ts";
@@ -15,8 +15,8 @@ import {
   kvUpdateConfig,
   resolveKvFlushIntervalMs,
 } from "./config.ts";
-import { kvGetAllKeys } from "./api-keys.ts";
-import { kvBackfillApiKeyValueIndex } from "./api-keys-index.ts";
+import { ApiKeyStoreInvariantError } from "./api-key-store.ts";
+import { kvGetAllKeys, kvMergeApiKeyUsage } from "./api-keys.ts";
 import { kvGetAllProxyKeys } from "./proxy-keys.ts";
 import { getApiKeyCacheRevision, getAuthCacheRevision } from "./revisions.ts";
 import { metrics } from "../metrics.ts";
@@ -47,28 +47,20 @@ async function flushApiKeyStats(id: string): Promise<void> {
   const keyEntry = state.cachedKeysById.get(id);
   if (!keyEntry) return;
 
-  const key = [...API_KEY_PREFIX, id];
-  const entry = await state.kv.get<ApiKey>(key);
-  const persisted = entry.value;
-  if (persisted === null) return;
+  try {
+    const result = await kvMergeApiKeyUsage(
+      id,
+      keyEntry.useCount,
+      keyEntry.lastUsed,
+    );
+    if (result === "conflict") state.dirtyKeyIds.add(id);
+  } catch (error) {
+    if (!(error instanceof ApiKeyStoreInvariantError)) throw error;
 
-  // CAS prevents a stale stats write from recreating or overwriting a key that
-  // changed after the read.
-  const result = await state.kv.atomic()
-    .check(entry)
-    .set(key, {
-      ...persisted,
-      useCount: Math.max(persisted.useCount, keyEntry.useCount),
-      lastUsed: Math.max(persisted.lastUsed ?? 0, keyEntry.lastUsed ?? 0) ||
-        undefined,
-    })
-    .commit();
-
-  if (result.ok) return;
-
-  const latest = await state.kv.get<ApiKey>(key);
-  if (latest.value !== null) {
-    state.dirtyKeyIds.add(id);
+    // Repeating the same stats write cannot repair a broken record/claim
+    // invariant. Isolate the bad key so unrelated stats and config still flush.
+    metrics.inc("api_key_usage_flush_total", "store_corrupt");
+    logger.error("api_key_usage_flush_store_corrupt", { keyId: id }, error);
   }
 }
 
@@ -102,6 +94,7 @@ async function flushProxyKeyStats(id: string): Promise<void> {
     state.dirtyProxyKeyIds.add(id);
   }
 }
+
 /**
  * Flushes batched hot-path counters to KV without overwriting immediate CRUD writes.
  */
@@ -175,39 +168,29 @@ export async function flushDirtyToKv(): Promise<void> {
 
 /**
  * Loads persisted config and key records into the hot-path in-memory caches.
+ * API-key loading validates the record/claim bijection before decrypting any
+ * value, so an incompatible or corrupt store fails startup instead of silently
+ * weakening duplicate protection.
  */
 export async function bootstrapCache(): Promise<void> {
-  state.cachedConfig = await kvGetConfig();
+  const [config, apiKeyRevision] = await Promise.all([
+    kvGetConfig(),
+    getApiKeyCacheRevision(),
+  ]);
+  state.cachedConfig = config;
   const keys = await kvGetAllKeys();
-  state.cachedKeysById = new Map(keys.map((k) => [k.id, k]));
+  state.cachedKeysById = new Map(keys.map((key) => [key.id, key]));
   rebuildActiveKeyIds();
   rebuildModelPoolCache();
 
   const proxyKeys = await kvGetAllProxyKeys();
-  state.cachedProxyKeys = new Map(proxyKeys.map((k) => [k.id, k]));
+  state.cachedProxyKeys = new Map(proxyKeys.map((key) => [key.id, key]));
   state.proxyKeyCacheLastLoadedAt = Date.now();
   state.authCacheRevision = await getAuthCacheRevision();
   state.authCacheRevisionLastCheckedAt = Date.now();
-  state.apiKeyCacheRevision = await getApiKeyCacheRevision();
+  // Keep the revision at or behind the loaded snapshot. A mutation after the
+  // initial read is observed by the normal refresh path instead of being hidden
+  // behind a newer revision than the cache actually contains.
+  state.apiKeyCacheRevision = apiKeyRevision;
   state.apiKeyCacheRevisionLastCheckedAt = Date.now();
-
-  // Issue #139: ensure the secondary value-digest index exists for every
-  // persisted api key. Idempotent — safe to run on every cold start. Run
-  // after the cache is populated so a subsequent kvAddKey can rely on
-  // the index for cross-instance duplicate detection.
-  try {
-    const { created, preExistingDuplicates } =
-      await kvBackfillApiKeyValueIndex();
-    if (created > 0 || preExistingDuplicates > 0) {
-      logger.info("api_key_value_index_backfill", {
-        created,
-        preExistingDuplicates,
-      });
-    }
-  } catch (error) {
-    // Backfill failure must not block startup — duplicate detection
-    // simply degrades to the in-memory cache check until the next
-    // bootstrap (or a successful kvAddKey path that creates the entry).
-    logger.warn("api_key_value_index_backfill_failed", {}, error);
-  }
 }

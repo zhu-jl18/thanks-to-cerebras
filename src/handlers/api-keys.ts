@@ -1,7 +1,12 @@
 import { adminJsonResponse, adminProblemResponse } from "../http.ts";
 import { maskKey, parseBatchInput } from "../utils.ts";
-import { kvAddKey, kvDeleteKey, kvGetAllKeys } from "../kv/api-keys.ts";
-import { kvMigrateApiKeysToEncrypted } from "../kv/api-keys-migrate.ts";
+import {
+  type AddApiKeyResult,
+  type DeleteApiKeyResult,
+  kvAddKey,
+  kvDeleteKey,
+  kvGetAllKeys,
+} from "../kv/api-keys.ts";
 import { testKey } from "../services/api-keys.ts";
 import { logger } from "../logger.ts";
 import type { Router } from "../router.ts";
@@ -9,14 +14,38 @@ import type { Router } from "../router.ts";
 async function listApiKeys(): Promise<Response> {
   const keys = await kvGetAllKeys();
   keys.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-  const keyMetadata = keys.map((k) => ({
-    id: k.id,
-    useCount: k.useCount,
-    lastUsed: k.lastUsed,
-    status: k.status,
-    createdAt: k.createdAt,
+  const keyMetadata = keys.map((key) => ({
+    id: key.id,
+    useCount: key.useCount,
+    lastUsed: key.lastUsed,
+    status: key.status,
+    createdAt: key.createdAt,
   }));
   return adminJsonResponse({ keys: keyMetadata });
+}
+
+function describeAddFailure(
+  code: Extract<AddApiKeyResult, { ok: false }>["code"],
+): { message: string; status: number } {
+  switch (code) {
+    case "duplicate":
+      return { message: "密钥已存在", status: 409 };
+    case "conflict":
+      return { message: "密钥保存冲突，请重试", status: 409 };
+  }
+}
+
+function describeDeleteFailure(
+  code: Extract<DeleteApiKeyResult, { ok: false }>["code"],
+): { message: string; status: number } {
+  switch (code) {
+    case "not-found":
+      return { message: "密钥不存在", status: 404 };
+    case "conflict":
+      return { message: "密钥删除冲突，请重试", status: 409 };
+    case "store-corrupt":
+      return { message: "密钥存储状态异常", status: 500 };
+  }
 }
 
 async function addApiKey(req: Request): Promise<Response> {
@@ -30,14 +59,15 @@ async function addApiKey(req: Request): Promise<Response> {
     }
 
     const result = await kvAddKey(key);
-    if (!result.success) {
-      return adminProblemResponse(result.error ?? "添加失败", {
-        status: result.error === "密钥已存在" ? 409 : 400,
+    if (!result.ok) {
+      const failure = describeAddFailure(result.code);
+      return adminProblemResponse(failure.message, {
+        status: failure.status,
         instance: "/api/keys",
       });
     }
 
-    return adminJsonResponse(result, { status: 201 });
+    return adminJsonResponse({ success: true, id: result.id }, { status: 201 });
   } catch (error) {
     logger.error("api_key_create_failed", {}, error);
     return adminProblemResponse("请求处理失败", {
@@ -74,12 +104,12 @@ async function batchImportApiKeys(req: Request): Promise<Response> {
 
     for (const key of keys) {
       const result = await kvAddKey(key);
-      if (result.success) {
+      if (result.ok) {
         results.success.push(maskKey(key));
       } else {
         results.failed.push({
           key: maskKey(key),
-          error: result.error || "未知错误",
+          error: describeAddFailure(result.code).message,
         });
       }
     }
@@ -123,13 +153,14 @@ async function deleteApiKey(
   params: Record<string, string>,
 ): Promise<Response> {
   const result = await kvDeleteKey(params.id);
-  if (!result.success) {
-    return adminProblemResponse(result.error ?? "删除失败", {
-      status: result.error === "密钥不存在" ? 404 : 400,
+  if (!result.ok) {
+    const failure = describeDeleteFailure(result.code);
+    return adminProblemResponse(failure.message, {
+      status: failure.status,
       instance: `/api/keys/${params.id}`,
     });
   }
-  return adminJsonResponse(result);
+  return adminJsonResponse({ success: true });
 }
 
 async function testApiKey(
@@ -139,17 +170,11 @@ async function testApiKey(
   return adminJsonResponse(await testKey(params.id));
 }
 
-async function migrateApiKeys(): Promise<Response> {
-  const migrated = await kvMigrateApiKeysToEncrypted();
-  return adminJsonResponse({ success: true, migrated });
-}
-
 export function register(router: Router): void {
   router
     .get("/api/keys", listApiKeys)
     .post("/api/keys", addApiKey)
     .post("/api/keys/batch", batchImportApiKeys)
-    .post("/api/keys/migrate", migrateApiKeys)
     .get("/api/keys/export", exportAllApiKeys)
     .get("/api/keys/:id/export", exportApiKey)
     .delete("/api/keys/:id", deleteApiKey)

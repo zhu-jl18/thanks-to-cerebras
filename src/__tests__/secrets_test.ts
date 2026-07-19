@@ -3,7 +3,9 @@ import {
   assertKeyEncryptionSecretConfigured,
   decryptApiKey,
   encryptApiKey,
+  fingerprintApiKey,
   hashProxyKey,
+  isApiKeyFingerprint,
   isEncryptedApiKey,
   isHashedProxyKey,
   verifyProxyKey,
@@ -19,11 +21,31 @@ Deno.test("secrets - encrypts API keys without storing plaintext", async () => {
   assertEquals(await decryptApiKey(encrypted), "sk-unit-secret");
 });
 
+Deno.test("secrets - derives stable deployment-scoped fingerprints", async () => {
+  Deno.env.set("KEY_ENCRYPTION_SECRET", "unit-secret-a");
+  const first = await fingerprintApiKey("sk-unit-secret");
+  const second = await fingerprintApiKey("sk-unit-secret");
+
+  Deno.env.set("KEY_ENCRYPTION_SECRET", "unit-secret-b");
+  const otherDeployment = await fingerprintApiKey("sk-unit-secret");
+
+  assertEquals(first, second);
+  assertEquals(first !== otherDeployment, true);
+  assertEquals(first.includes("sk-unit-secret"), false);
+  assertEquals(isApiKeyFingerprint(first), true);
+  assertEquals(isApiKeyFingerprint("v1$api-key-hmac-sha256$bad"), false);
+});
+
 Deno.test("secrets - fails fast when encryption secret is missing", async () => {
   Deno.env.delete("KEY_ENCRYPTION_SECRET");
 
   await assertRejects(
     () => encryptApiKey("sk-unit-secret"),
+    Error,
+    "KEY_ENCRYPTION_SECRET 未配置",
+  );
+  await assertRejects(
+    () => fingerprintApiKey("sk-unit-secret"),
     Error,
     "KEY_ENCRYPTION_SECRET 未配置",
   );

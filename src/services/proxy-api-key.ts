@@ -1,4 +1,5 @@
 import { getNextApiKeyFast, refreshApiKeyCacheIfChanged } from "../api-keys.ts";
+import { PROXY_KEY_AUTH_REFRESH_INTERVAL_MS } from "../constants.ts";
 import { kvMergeAllApiKeysIntoCache } from "../kv/api-keys.ts";
 import { logger } from "../logger.ts";
 import { metrics } from "../metrics.ts";
@@ -13,9 +14,26 @@ export type ProxyApiKeySelection =
 export async function selectProxyApiKey(
   context: Readonly<Record<string, string | undefined>>,
 ): Promise<ProxyApiKeySelection> {
+  const now = Date.now();
+  const emptyPoolVerificationDue =
+    now - state.apiKeyCacheRevisionLastCheckedAt >=
+      PROXY_KEY_AUTH_REFRESH_INTERVAL_MS;
+  const revisionBeforeRefresh = state.apiKeyCacheRevision;
+
   await refreshApiKeyCacheIfChanged();
   const cached = getNextApiKeyFast(Date.now());
   if (cached) return { ok: true, key: cached };
+
+  const cacheContainsActiveKeys = state.cachedActiveKeyIds.length > 0;
+  const revisionRefreshLoadedChanges =
+    state.apiKeyCacheRevision !== revisionBeforeRefresh;
+  if (
+    cacheContainsActiveKeys ||
+    !emptyPoolVerificationDue ||
+    revisionRefreshLoadedChanges
+  ) {
+    return noApiKeySelection();
+  }
 
   try {
     await kvMergeAllApiKeysIntoCache();

@@ -52,8 +52,11 @@ HMAC(decrypt(record[id].encryptedKey)) == fp
 - 更新：只更新主记录元数据；fingerprint、ciphertext 和 claim ownership 不变。
 - 多实例添加同值 key 时竞争同一个 claim slot，只有一个事务成功。
 
-全量 `list` 和 cache refresh 会校验 record/claim 双向关系后再解密记录。若 invariant
-不成立，保留最后一次已验证的内存缓存并记录错误，而不是跳过损坏项后继续运行。
+全量 `list` 和 cache refresh 会用 cache revision 包围 record/claim 两次 prefix scan；
+扫描期间发生结构性 CRUD 时会重试，只有 revision 稳定的结果才进入双向 invariant
+校验和并行解密。单记录 CRUD 在发现 claim 不匹配时会复查主记录 versionstamp，区分
+正常并发删除、需要重试的并发更新和真正的存储损坏。若最终 invariant 不成立，系统
+保留最后一次已验证的内存缓存并记录错误，而不是跳过损坏项后继续运行。
 
 ## 鉴权逻辑
 

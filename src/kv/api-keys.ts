@@ -1,78 +1,56 @@
 import type { ApiKey } from "../types.ts";
-import {
-  assertCurrentApiKey,
-  type PersistedApiKey,
-  toPersistedApiKey,
-} from "../api-key-record.ts";
-import {
-  API_KEY_CACHE_REVISION_KEY,
-  API_KEY_PREFIX,
-  KV_ATOMIC_MAX_RETRIES,
-} from "../constants.ts";
-import { generateId } from "../utils.ts";
-import { sha256Hex } from "../crypto.ts";
 import { rebuildActiveKeyIds } from "../api-keys.ts";
-import { decryptApiKey, encryptApiKey } from "../secrets.ts";
-import { logger } from "../logger.ts";
-import { metrics } from "../metrics.ts";
 import { state } from "../state.ts";
+import { recordApiKeyCacheRevision } from "./revisions.ts";
 import {
-  getNextRevisionValue,
-  recordApiKeyCacheRevision,
-} from "./revisions.ts";
-import {
-  applyApiKeyValueIndexRelease,
-  kvPlanApiKeyValueIndexRelease,
-  valueIndexKey,
-} from "./api-keys-index.ts";
-import { waitForKvAtomicRetry } from "./atomic-retry.ts";
+  createApiKeyStore,
+  type ApiKeyUsageMergeResult,
+} from "./api-key-store.ts";
 
-async function hydrateApiKey(value: unknown): Promise<ApiKey> {
-  const persisted = assertCurrentApiKey(value);
-  return { ...persisted, key: await decryptApiKey(persisted.encryptedKey) };
+export type AddApiKeyResult =
+  | { ok: true; id: string }
+  | { ok: false; code: "duplicate" | "conflict" };
+
+export type DeleteApiKeyResult =
+  | { ok: true }
+  | {
+    ok: false;
+    code: "not-found" | "conflict" | "store-corrupt";
+  };
+
+export type ApiKeyUpdate = Partial<
+  Pick<ApiKey, "status" | "useCount" | "lastUsed">
+>;
+
+function store() {
+  return createApiKeyStore(state.kv);
 }
-async function kvGetAllKeysWithSkipped(): Promise<
-  { keys: ApiKey[]; skippedKeyIds: Set<string> }
-> {
-  const keys: ApiKey[] = [];
-  const skippedKeyIds = new Set<string>();
-  const iter = state.kv.list({ prefix: API_KEY_PREFIX });
-  for await (const entry of iter) {
-    try {
-      keys.push(await hydrateApiKey(entry.value));
-    } catch (error) {
-      const rawId = entry.key[API_KEY_PREFIX.length];
-      const keyId = typeof rawId === "string" ? rawId : undefined;
-      if (keyId) skippedKeyIds.add(keyId); // string ids only — must match cachedKeysById to be skip-protected
-      const fields = { keyId, kvKey: String(entry.key) };
-      logger.warn("api_key_hydrate_failed", fields, error);
-      metrics.inc("api_key_hydrate_failed_total", "skipped");
-    }
-  }
-  return { keys, skippedKeyIds };
+
+function removeApiKeyFromCache(id: string): void {
+  state.cachedKeysById.delete(id);
+  state.keyCooldownUntil.delete(id);
+  state.dirtyKeyIds.delete(id);
+  rebuildActiveKeyIds();
 }
-export async function kvGetAllKeys(): Promise<ApiKey[]> {
-  return (await kvGetAllKeysWithSkipped()).keys;
+
+export function kvGetAllKeys(): Promise<ApiKey[]> {
+  return store().list();
 }
+
 export async function kvMergeAllApiKeysIntoCache(): Promise<void> {
-  const { keys, skippedKeyIds } = await kvGetAllKeysWithSkipped();
+  const keys = await kvGetAllKeys();
   const loadedIds = new Set(keys.map((key) => key.id));
   for (const id of state.cachedKeysById.keys()) {
-    if (!loadedIds.has(id) && !skippedKeyIds.has(id)) {
+    if (!loadedIds.has(id)) {
       state.cachedKeysById.delete(id);
       state.keyCooldownUntil.delete(id);
       state.dirtyKeyIds.delete(id);
     }
   }
+
   for (const key of keys) {
     const local = state.cachedKeysById.get(key.id);
-    if (!local) {
-      state.cachedKeysById.set(key.id, key);
-      continue;
-    }
-
-    const isDirty = state.dirtyKeyIds.has(key.id);
-    if (!isDirty) {
+    if (!local || !state.dirtyKeyIds.has(key.id)) {
       state.cachedKeysById.set(key.id, key);
       continue;
     }
@@ -94,212 +72,72 @@ export async function kvGetApiKeyById(id: string): Promise<ApiKey | null> {
   const cached = state.cachedKeysById.get(id);
   if (cached) return cached;
 
-  const entry = await state.kv.get<PersistedApiKey>([...API_KEY_PREFIX, id]);
-  if (!entry.value) return null;
-
-  const hydrated = await hydrateApiKey(entry.value);
-  state.cachedKeysById.set(id, hydrated);
+  const key = await store().get(id);
+  if (!key) return null;
+  state.cachedKeysById.set(id, key);
   rebuildActiveKeyIds();
-  return hydrated;
+  return key;
 }
 
-let lastApiKeyCreatedAtMs = 0;
-export async function kvAddKey(
-  key: string,
-): Promise<{ success: boolean; id?: string; error?: string }> {
-  // The in-memory cache check is an optimistic fast path: if THIS instance
-  // already knows the value, skip the KV roundtrips. The authoritative
-  // duplicate check is the value-index entry below, which catches the
-  // multi-instance / stale-cache case described in issue #139.
-  const allKeys = Array.from(state.cachedKeysById.values());
-  const existingKey = allKeys.find((k) => k.key === key);
-  if (existingKey) {
-    return { success: false, error: "密钥已存在" };
+export async function kvAddKey(key: string): Promise<AddApiKeyResult> {
+  if (Array.from(state.cachedKeysById.values()).some((item) => item.key === key)) {
+    return { ok: false, code: "duplicate" };
   }
 
-  const valueDigest = await sha256Hex(key);
-  const indexKey = valueIndexKey(valueDigest);
+  const result = await store().create(key);
+  if (!result.ok) return result;
 
-  const id = generateId();
-  const now = Date.now();
-  const createdAt = now <= lastApiKeyCreatedAtMs
-    ? lastApiKeyCreatedAtMs + 1
-    : now;
-  lastApiKeyCreatedAtMs = createdAt;
-  const encryptedKey = await encryptApiKey(key);
-  const newKey: ApiKey = {
-    id,
-    encryptedKey,
-    key,
-    useCount: 0,
-    status: "active",
-    createdAt,
-  };
-
-  const [revisionEntry, idEntry, indexEntry] = await Promise.all([
-    state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
-    state.kv.get([...API_KEY_PREFIX, id]),
-    state.kv.get<string>(indexKey),
-  ]);
-  if (idEntry.value !== null) {
-    return { success: false, error: "密钥保存冲突，请重试" };
-  }
-  if (indexEntry.value !== null) {
-    // Another instance (or a previous request that landed before this
-    // instance's cache caught up) already persisted this exact value.
-    return { success: false, error: "密钥已存在" };
-  }
-  const revision = getNextRevisionValue(revisionEntry);
-  const result = await state.kv.atomic()
-    .check(idEntry)
-    .check(indexEntry)
-    .check(revisionEntry)
-    .set([...API_KEY_PREFIX, id], toPersistedApiKey(newKey))
-    .set(indexKey, id)
-    .set(API_KEY_CACHE_REVISION_KEY, revision)
-    .commit();
-  if (!result.ok) {
-    // CAS lost — by far the most likely cause is another instance just
-    // wrote the same plaintext via its own atomic. Re-read the index so
-    // the caller (and ultimately the HTTP handler) gets the duplicate
-    // error → 409 instead of the generic save-conflict error → 400.
-    const postCheck = await state.kv.get<string>(indexKey);
-    if (postCheck.value !== null) {
-      return { success: false, error: "密钥已存在" };
-    }
-    return { success: false, error: "密钥保存失败，请重试" };
-  }
-  state.cachedKeysById.set(id, newKey);
+  state.cachedKeysById.set(result.key.id, result.key);
   rebuildActiveKeyIds();
-  recordApiKeyCacheRevision(revision);
-
-  return { success: true, id };
+  recordApiKeyCacheRevision(result.revision);
+  return { ok: true, id: result.key.id };
 }
 
-export async function kvDeleteKey(
-  id: string,
-): Promise<{ success: boolean; error?: string }> {
-  const key = [...API_KEY_PREFIX, id];
-  const result = await state.kv.get(key);
-  if (!result.value) {
-    return { success: false, error: "密钥不存在" };
-  }
-  // Validate at the runtime boundary — the generic on state.kv.get is a
-  // TypeScript-level promise, not a guarantee. A malformed / corrupted
-  // record (migration bug, manual KV write, cross-version payload)
-  // surfaces as the expected "格式不兼容" error here instead of a less
-  // diagnosable TypeError on the next property access.
-  const persisted = assertCurrentApiKey(result.value);
+export async function kvDeleteKey(id: string): Promise<DeleteApiKeyResult> {
+  const result = await store().delete(id);
+  if (!result.ok) return result;
 
-  // The index module owns digest resolution and the exceptional legacy-
-  // duplicate scan. The delete path only consumes its release plan.
-  const cached = state.cachedKeysById.get(id);
-  const plaintext = cached?.key ??
-    await decryptApiKey(persisted.encryptedKey);
-  const [indexPlan, revisionEntry] = await Promise.all([
-    kvPlanApiKeyValueIndexRelease(id, plaintext),
-    state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
-  ]);
-  if (indexPlan.action === "blocked") {
-    // Removing the owner would erase the only known protection while an
-    // unreadable record might still contain the same plaintext. Abort without
-    // mutating either the owner or the index; a later retry can succeed after
-    // the candidate is repaired, migrated, or removed.
-    logger.warn("api_key_value_index_release_blocked", {
-      keyId: id,
-      candidateId: indexPlan.candidateId,
-    });
-    return { success: false, error: "密钥删除失败，请重试" };
-  }
-
-  const revision = getNextRevisionValue(revisionEntry);
-
-  // The release helper owns the index-snapshot CAS. Promotion additionally
-  // CASes the replacement record, so the transaction cannot install a dangling
-  // index under a concurrent update or delete.
-  const atomic = applyApiKeyValueIndexRelease(
-    state.kv.atomic()
-      .check(result)
-      .check(revisionEntry)
-      .delete(key)
-      .set(API_KEY_CACHE_REVISION_KEY, revision),
-    indexPlan,
-  );
-
-  const deleteResult = await atomic.commit();
-  if (!deleteResult.ok) {
-    return { success: false, error: "密钥删除失败，请重试" };
-  }
-  state.cachedKeysById.delete(id);
-  state.keyCooldownUntil.delete(id);
-  state.dirtyKeyIds.delete(id);
-  rebuildActiveKeyIds();
-  recordApiKeyCacheRevision(revision);
-  return { success: true };
+  removeApiKeyFromCache(id);
+  recordApiKeyCacheRevision(result.revision);
+  return { ok: true };
 }
 
 export async function kvUpdateKey(
   id: string,
-  updates: Partial<ApiKey>,
+  updates: ApiKeyUpdate,
 ): Promise<{ updated: boolean }> {
-  const cached = state.cachedKeysById.get(id);
-  if (!cached && !(await kvGetApiKeyById(id))) {
-    return { updated: false };
-  }
+  const local = state.cachedKeysById.get(id);
+  const result = await store().update(id, (current) => ({
+    status: updates.status ??
+      (local?.status === "invalid" ? "invalid" : current.status),
+    useCount: updates.useCount ??
+      Math.max(local?.useCount ?? 0, current.useCount),
+    lastUsed: updates.lastUsed ??
+      (Math.max(local?.lastUsed ?? 0, current.lastUsed ?? 0) || undefined),
+  }));
 
-  const kvKey = [...API_KEY_PREFIX, id];
-
-  for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
-    const [entry, revisionEntry] = await Promise.all([
-      state.kv.get<PersistedApiKey>(kvKey),
-      state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
-    ]);
-
-    if (!entry.value) {
-      const local = state.cachedKeysById.get(id);
-      if (local) {
-        state.cachedKeysById.delete(id);
-        state.keyCooldownUntil.delete(id);
-        state.dirtyKeyIds.delete(id);
-        rebuildActiveKeyIds();
-      }
+  if (!result.ok) {
+    if (result.code === "not-found") {
+      removeApiKeyFromCache(id);
       return { updated: false };
     }
-
-    const persisted = await hydrateApiKey(entry.value);
-    const local = state.cachedKeysById.get(id);
-    const plaintext = local?.key ?? persisted.key;
-
-    const useCount = updates.useCount ??
-      Math.max(local?.useCount ?? 0, persisted.useCount);
-    const lastUsed = updates.lastUsed ??
-      (Math.max(local?.lastUsed ?? 0, persisted.lastUsed ?? 0) || undefined);
-
-    const updated: ApiKey = {
-      ...persisted,
-      ...updates,
-      key: plaintext,
-      useCount,
-      lastUsed,
-    };
-
-    const revision = getNextRevisionValue(revisionEntry);
-    const result = await state.kv.atomic()
-      .check(entry)
-      .check(revisionEntry)
-      .set(kvKey, toPersistedApiKey(updated))
-      .set(API_KEY_CACHE_REVISION_KEY, revision)
-      .commit();
-
-    if (result.ok) {
-      state.cachedKeysById.set(id, updated);
-      rebuildActiveKeyIds();
-      recordApiKeyCacheRevision(revision);
-      return { updated: true };
+    if (result.code === "store-corrupt") {
+      throw new Error("API key 存储状态异常");
     }
-
-    await waitForKvAtomicRetry(attempt);
+    throw new Error("密钥更新失败：达到最大重试次数");
   }
 
-  throw new Error("密钥更新失败：达到最大重试次数");
+  state.cachedKeysById.set(id, result.key);
+  state.dirtyKeyIds.delete(id);
+  rebuildActiveKeyIds();
+  recordApiKeyCacheRevision(result.revision);
+  return { updated: true };
+}
+
+export function kvMergeApiKeyUsage(
+  id: string,
+  useCount: number,
+  lastUsed?: number,
+): Promise<ApiKeyUsageMergeResult> {
+  return store().mergeUsage(id, useCount, lastUsed);
 }

@@ -32,7 +32,8 @@ Client -> /v1/chat/completions -> Deno Proxy -> Cerebras API
 
 API-key store 采用严格 schema，不执行在线迁移或部分自愈。旧 API-key 记录、缺失
 claim、悬空 claim 或 fingerprint/ciphertext 不匹配都会被视为存储 invariant
-损坏；部署前应清空旧 API-key 数据并通过管理 API 重新导入。
+损坏；部署前应清空旧 API-key 数据并通过管理 API 重新导入。更换根密钥会同时改变
+密文解密域和 fingerprint 域，因此不支持同一 store 内的新旧根密钥混合轮换。
 
 ## API-key store invariant
 

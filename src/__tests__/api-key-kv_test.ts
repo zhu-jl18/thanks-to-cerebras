@@ -61,7 +61,7 @@ Deno.test(
     kv.atomic = () => {
       const operation = originalAtomic();
       const originalCommit = operation.commit.bind(operation);
-      operation.commit = async () => {
+      operation.commit = () => {
         if (!failedOnce) {
           failedOnce = true;
           const cached = state.cachedKeysById.get(id);
@@ -71,7 +71,9 @@ Deno.test(
             useCount: 9,
             lastUsed: 1_234,
           });
-          return { ok: false } as unknown as Deno.KvCommitResult;
+          return Promise.resolve(
+            { ok: false } as unknown as Deno.KvCommitResult,
+          );
         }
         return originalCommit();
       };

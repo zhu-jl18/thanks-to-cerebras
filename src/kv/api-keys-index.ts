@@ -58,6 +58,12 @@ export function valueIndexKey(digest: string): Deno.KvKey {
   return [...API_KEY_VALUE_INDEX_PREFIX, digest];
 }
 
+/**
+ * Performs the only authoritative lookup available for legacy duplicates,
+ * which have no reverse digest-membership index. The O(n) scan is deliberately
+ * confined to deleting the current value-index owner; maintaining a second
+ * persistent multimap would widen every write and migration repair surface.
+ */
 async function findApiKeyValueIndexReplacement(
   deletingId: string,
   plaintext: string,
@@ -100,7 +106,7 @@ async function findApiKeyValueIndexReplacement(
     }
   }
 
-  return unreadableCandidateId
+  return unreadableCandidateId !== undefined
     ? { status: "blocked", candidateId: unreadableCandidateId }
     : { status: "not-found" };
 }
@@ -134,22 +140,22 @@ export async function kvPlanApiKeyValueIndexRelease(
 }
 
 /**
- * Applies an executable release plan to the caller's atomic operation. The
- * caller must CAS `plan.indexEntry`; promotion additionally CASes the
- * replacement record so a concurrent delete cannot leave the index pointing
- * at a vanished id.
+ * Applies an executable release plan and CASes its index snapshot. Promotion
+ * additionally CASes the replacement record so a concurrent delete cannot
+ * leave the index pointing at a vanished id.
  */
 export function applyApiKeyValueIndexRelease(
   atomic: KvAtomicOperation,
   plan: ExecutableApiKeyValueIndexReleasePlan,
 ): KvAtomicOperation {
+  const checkedAtomic = atomic.check(plan.indexEntry);
   switch (plan.action) {
     case "preserve":
-      return atomic;
+      return checkedAtomic;
     case "delete":
-      return atomic.delete(plan.indexKey);
+      return checkedAtomic.delete(plan.indexKey);
     case "promote":
-      return atomic
+      return checkedAtomic
         .check(plan.replacement.entry)
         .set(plan.indexKey, plan.replacement.id);
   }

@@ -148,7 +148,12 @@ export async function createApiKey(
     if (result.ok) return { ok: true, key, revision };
     await waitForKvAtomicRetry(attempt);
   }
-  return { ok: false, code: "conflict" };
+
+  const finalClaimEntry = await kv.get<string>(claimKey);
+  return {
+    ok: false,
+    code: finalClaimEntry.value === null ? "conflict" : "duplicate",
+  };
 }
 
 export async function deleteApiKey(

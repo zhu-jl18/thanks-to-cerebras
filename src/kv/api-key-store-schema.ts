@@ -31,7 +31,8 @@ export function apiKeyUniqueClaimKey(fingerprint: string): Deno.KvKey {
 }
 
 function invariant(message: string, cause?: unknown): never {
-  throw new ApiKeyStoreInvariantError(message, { cause });
+  const detail = cause instanceof Error ? `: ${cause.message}` : "";
+  throw new ApiKeyStoreInvariantError(`${message}${detail}`, { cause });
 }
 
 export function assertApiKeyRecordEntry(

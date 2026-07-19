@@ -58,6 +58,11 @@ HMAC(decrypt(record[id].encryptedKey)) == fp
 正常并发删除、需要重试的并发更新和真正的存储损坏。若最终 invariant 不成立，系统
 保留最后一次已验证的内存缓存并记录错误，而不是跳过损坏项后继续运行。
 
+实现按职责分层：`api-key-store-schema.ts` 只拥有 tuple 与 invariant 校验，
+`api-key-store-operations.ts` 只拥有原子 CRUD 与并发分类，`api-key-store.ts` 是窄接口
+facade；代理侧的选 key、强制刷新与无可用 key 策略集中在 `proxy-api-key.ts`，不混入
+上游请求编排。
+
 ## 鉴权逻辑
 
 代理访问密钥存储在 KV，默认拒绝未授权访问。只有显式开启公开访问时，才允许无

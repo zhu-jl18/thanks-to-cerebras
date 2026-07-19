@@ -14,26 +14,25 @@ export type ProxyApiKeySelection =
 export async function selectProxyApiKey(
   context: Readonly<Record<string, string | undefined>>,
 ): Promise<ProxyApiKeySelection> {
-  const now = Date.now();
-  const emptyPoolVerificationDue =
-    now - state.apiKeyCacheRevisionLastCheckedAt >=
-      PROXY_KEY_AUTH_REFRESH_INTERVAL_MS;
-  const revisionBeforeRefresh = state.apiKeyCacheRevision;
-
   await refreshApiKeyCacheIfChanged();
   const cached = getNextApiKeyFast(Date.now());
   if (cached) return { ok: true, key: cached };
 
-  const cacheContainsActiveKeys = state.cachedActiveKeyIds.length > 0;
-  const revisionRefreshLoadedChanges =
-    state.apiKeyCacheRevision !== revisionBeforeRefresh;
+  // Cooldowns are already represented in the verified cache. A full store read
+  // cannot make a cooling key usable, so only a genuinely empty active pool may
+  // trigger the stricter fallback verification.
+  if (state.cachedActiveKeyIds.length > 0) return noApiKeySelection();
+
+  const now = Date.now();
   if (
-    cacheContainsActiveKeys ||
-    !emptyPoolVerificationDue ||
-    revisionRefreshLoadedChanges
+    now - state.apiKeyEmptyPoolRefreshLastAttemptAt <
+      PROXY_KEY_AUTH_REFRESH_INTERVAL_MS
   ) {
     return noApiKeySelection();
   }
+  // Advance before the await so concurrent requests in this isolate collapse
+  // into the same retry window even when the KV read fails.
+  state.apiKeyEmptyPoolRefreshLastAttemptAt = now;
 
   try {
     await kvMergeAllApiKeysIntoCache();

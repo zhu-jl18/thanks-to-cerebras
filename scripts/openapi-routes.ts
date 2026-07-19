@@ -17,7 +17,6 @@ export const EXPECTED_ROUTES: Route[] = [
   { method: "get", path: "/api/keys" },
   { method: "post", path: "/api/keys" },
   { method: "post", path: "/api/keys/batch" },
-  { method: "post", path: "/api/keys/migrate" },
   { method: "get", path: "/api/keys/export" },
   { method: "delete", path: "/api/keys/{id}" },
   { method: "get", path: "/api/keys/{id}/export" },

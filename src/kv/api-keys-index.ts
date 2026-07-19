@@ -7,8 +7,11 @@
  * Issue #139.
  */
 
+import {
+  assertCurrentApiKey,
+  type PersistedApiKey,
+} from "../api-key-record.ts";
 import { API_KEY_PREFIX, API_KEY_VALUE_INDEX_PREFIX } from "../constants.ts";
-import { assertCurrentApiKey } from "../api-key-record.ts";
 import { sha256Hex } from "../crypto.ts";
 import { decryptApiKey } from "../secrets.ts";
 import { logger } from "../logger.ts";
@@ -18,9 +21,43 @@ export function valueIndexKey(digest: string): Deno.KvKey {
   return [...API_KEY_VALUE_INDEX_PREFIX, digest];
 }
 
+async function persistedApiKeyDigest(
+  persisted: PersistedApiKey,
+): Promise<string> {
+  const plaintext = await decryptApiKey(persisted.encryptedKey);
+  return sha256Hex(plaintext);
+}
+
 /**
- * Walks the api-keys KV prefix and ensures every record has a matching
- * value-index entry. Idempotent — safe to run on every cold start.
+ * Finds a surviving record that can inherit a digest index when its current
+ * owner is deleted.
+ *
+ * The full KV entry is returned so the caller can CAS it in the same atomic
+ * operation that moves the index. This prevents promoting a record that was
+ * concurrently updated or deleted. The scan deliberately fails closed on an
+ * unreadable record: deleting the index without proving that no successor
+ * exists would reopen the duplicate-write window.
+ */
+export async function kvFindApiKeyValueIndexSuccessor(
+  digest: string,
+  excludedId: string,
+): Promise<Deno.KvEntry<PersistedApiKey> | null> {
+  const iter = state.kv.list<PersistedApiKey>({ prefix: API_KEY_PREFIX });
+  for await (const entry of iter) {
+    const entryId = entry.key[API_KEY_PREFIX.length];
+    if (entryId === excludedId) continue;
+
+    const persisted = assertCurrentApiKey(entry.value);
+    if (await persistedApiKeyDigest(persisted) === digest) return entry;
+  }
+  return null;
+}
+
+/**
+ * Walks the api-keys KV prefix and ensures every plaintext digest is
+ * represented by a value-index entry. Idempotent — safe to run on every cold
+ * start. Pre-existing duplicate records intentionally share one index entry;
+ * the index protects the digest, not each individual record.
  *
  * Behaviour:
  * - Missing index → atomically create it pointing at the record's id.
@@ -42,8 +79,7 @@ export async function kvBackfillApiKeyValueIndex(): Promise<{
   const iter = state.kv.list({ prefix: API_KEY_PREFIX });
   for await (const entry of iter) {
     const persisted = assertCurrentApiKey(entry.value);
-    const plaintext = await decryptApiKey(persisted.encryptedKey);
-    const digest = await sha256Hex(plaintext);
+    const digest = await persistedApiKeyDigest(persisted);
     const indexKey = valueIndexKey(digest);
     const indexEntry = await state.kv.get<string>(indexKey);
     if (indexEntry.value === persisted.id) continue;

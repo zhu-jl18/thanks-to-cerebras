@@ -1,10 +1,10 @@
 import { PROXY_KEY_AUTH_REFRESH_INTERVAL_MS } from "./constants.ts";
 import { state } from "./state.ts";
+import { kvMergeAllApiKeysIntoCache, kvUpdateKey } from "./kv/api-keys.ts";
 import {
-  kvMergeAllApiKeysIntoCache,
-  kvUpdateKey,
-} from "./kv/api-keys.ts";
-import { getApiKeyCacheRevision, recordApiKeyCacheRevision } from "./kv/revisions.ts";
+  getApiKeyCacheRevision,
+  recordApiKeyCacheRevision,
+} from "./kv/revisions.ts";
 import { logger } from "./logger.ts";
 
 export function rebuildActiveKeyIds(): void {

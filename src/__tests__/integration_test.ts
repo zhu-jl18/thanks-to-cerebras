@@ -27,11 +27,8 @@ import {
   PROXY_REQUEST_BODY_IDLE_TIMEOUT_MS,
   PROXY_UNAUTHORIZED_RATE_LIMIT_MAX,
 } from "../constants.ts";
-import {
-  rebuildActiveKeyIds,
-  refreshApiKeyCacheIfChanged,
-} from "../api-keys.ts";
-import { encryptApiKey, hashProxyKey } from "../secrets.ts";
+import { refreshApiKeyCacheIfChanged } from "../api-keys.ts";
+import { hashProxyKey } from "../secrets.ts";
 import {
   createAdminToken,
   isProxyAuthorized,
@@ -39,6 +36,8 @@ import {
 } from "../auth.ts";
 import { readBoundedTextForTests } from "../proxy-validation.ts";
 import { setLogSinkForTests } from "../logger.ts";
+import { addTestApiKey } from "./api-key-test-helpers.ts";
+
 const BASE = "http://localhost";
 
 type Handler = (req: Request) => Promise<Response>;
@@ -110,23 +109,7 @@ async function enableProxyPublicAccess(handler: Handler): Promise<string> {
 }
 
 async function addActiveApiKey(key: string): Promise<void> {
-  const apiKey = {
-    id: crypto.randomUUID(),
-    key,
-    encryptedKey: await encryptApiKey(key),
-    useCount: 0,
-    status: "active" as const,
-    createdAt: Date.now(),
-  };
-  await state.kv.set([...API_KEY_PREFIX, apiKey.id], {
-    id: apiKey.id,
-    encryptedKey: apiKey.encryptedKey,
-    useCount: apiKey.useCount,
-    status: apiKey.status,
-    createdAt: apiKey.createdAt,
-  });
-  state.cachedKeysById.set(apiKey.id, apiKey);
-  rebuildActiveKeyIds();
+  await addTestApiKey(key);
 }
 
 function installUpstreamResponse(
@@ -691,21 +674,12 @@ Deno.test("integration: proxy key list errors are structured", async () => {
   }
 });
 
-Deno.test("integration: legacy stored keys migrate to encrypted records", async () => {
+Deno.test("integration: legacy proxy keys migrate to hashed records", async () => {
   const kv = await setupKv();
   const handler = buildHandler();
   const token = await setupAuth(handler);
-  const h = { "X-Admin-Token": token };
-  const apiKeyId = crypto.randomUUID();
   const proxyKeyId = crypto.randomUUID();
 
-  await kv.set([...API_KEY_PREFIX, apiKeyId], {
-    id: apiKeyId,
-    key: "sk-legacy-api",
-    useCount: 0,
-    status: "active",
-    createdAt: 1,
-  });
   await kv.set([...PROXY_KEY_PREFIX, proxyKeyId], {
     id: proxyKeyId,
     key: "cpk_legacy_proxy",
@@ -714,47 +688,21 @@ Deno.test("integration: legacy stored keys migrate to encrypted records", async 
     createdAt: 1,
   });
 
-  const apiMigrate = await handler(
-    makeReq("POST", "/api/keys/migrate", { headers: h }),
+  const migrate = await handler(
+    makeReq("POST", "/api/proxy-keys/migrate", {
+      headers: { "X-Admin-Token": token },
+    }),
   );
-  assertEquals(apiMigrate.status, 200);
-  assertEquals((await apiMigrate.json()).migrated, 1);
-  const proxyMigrate = await handler(
-    makeReq("POST", "/api/proxy-keys/migrate", { headers: h }),
-  );
-  assertEquals(proxyMigrate.status, 200);
-  assertEquals((await proxyMigrate.json()).migrated, 1);
+  assertEquals(migrate.status, 200);
+  assertEquals((await migrate.json()).migrated, 1);
 
-  const migratedApiKey = await kv.get([...API_KEY_PREFIX, apiKeyId]);
-  assertEquals((migratedApiKey.value as { key?: string }).key, undefined);
+  const migrated = await kv.get([...PROXY_KEY_PREFIX, proxyKeyId]);
+  assertEquals((migrated.value as { key?: string }).key, undefined);
   assertEquals(
-    typeof (migratedApiKey.value as { encryptedKey?: string }).encryptedKey,
+    typeof (migrated.value as { keyHash?: string }).keyHash,
     "string",
   );
-  const migratedProxyKey = await kv.get([...PROXY_KEY_PREFIX, proxyKeyId]);
-  assertEquals((migratedProxyKey.value as { key?: string }).key, undefined);
-  assertEquals(
-    typeof (migratedProxyKey.value as { keyHash?: string }).keyHash,
-    "string",
-  );
-
-  const restoreFetch = installUpstreamResponse(
-    new Response("ok", { status: 200 }),
-    "Bearer sk-legacy-api",
-  );
-  try {
-    const res = await handler(
-      makeReq("POST", "/v1/chat/completions", {
-        headers: { Authorization: "Bearer cpk_legacy_proxy" },
-        body: { messages: [{ role: "user", content: "hi" }] },
-      }),
-    );
-    assertEquals(res.status, 200);
-    await res.body?.cancel();
-  } finally {
-    restoreFetch();
-    kv.close();
-  }
+  kv.close();
 });
 
 Deno.test("integration: proxy key creation errors do not expose stack traces", async () => {

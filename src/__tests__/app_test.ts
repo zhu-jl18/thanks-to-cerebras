@@ -67,7 +67,10 @@ Deno.test(
       const sanitized = await handler(
         makeReq("GET", "/healthz", { "X-Request-Id": oversizedId }),
       );
-      assertEquals(sanitized.headers.get("x-request-id") === oversizedId, false);
+      assertEquals(
+        sanitized.headers.get("x-request-id") === oversizedId,
+        false,
+      );
 
       const generatedLog = records.find((record) =>
         record.requestId === generatedId

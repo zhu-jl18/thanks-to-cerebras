@@ -5,10 +5,7 @@
 
 import { assertEquals, assertRejects } from "@std/assert";
 import { API_KEY_PREFIX, API_KEY_UNIQUE_PREFIX } from "../constants.ts";
-import {
-  fingerprintApiKey,
-  isApiKeyFingerprint,
-} from "../secrets.ts";
+import { fingerprintApiKey, isApiKeyFingerprint } from "../secrets.ts";
 import {
   kvAddKey,
   kvDeleteKey,
@@ -135,7 +132,9 @@ Deno.test(
         id,
       ]);
       const fingerprint = record.value?.fingerprint;
-      if (typeof fingerprint !== "string") throw new Error("fingerprint missing");
+      if (typeof fingerprint !== "string") {
+        throw new Error("fingerprint missing");
+      }
 
       // Neither the root secret nor a prefix scan is needed to delete: the
       // persisted fingerprint directly identifies the paired unique claim.
@@ -309,7 +308,9 @@ Deno.test(
         id,
       ]);
       const fingerprint = record.value?.fingerprint;
-      if (typeof fingerprint !== "string") throw new Error("fingerprint missing");
+      if (typeof fingerprint !== "string") {
+        throw new Error("fingerprint missing");
+      }
       const claimKey = apiKeyUniqueClaimKey(fingerprint);
 
       const originalAtomic = kv.atomic.bind(kv);
@@ -337,7 +338,10 @@ Deno.test(
       }
 
       assertEquals(raced, true);
-      assertEquals((await kv.get([...API_KEY_PREFIX, id])).value !== null, true);
+      assertEquals(
+        (await kv.get([...API_KEY_PREFIX, id])).value !== null,
+        true,
+      );
       assertEquals((await kv.get<string>(claimKey)).value, "concurrent-owner");
     } finally {
       setLogSinkForTests(null);

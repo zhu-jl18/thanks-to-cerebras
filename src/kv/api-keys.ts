@@ -3,8 +3,8 @@ import { rebuildActiveKeyIds } from "../api-keys.ts";
 import { state } from "../state.ts";
 import { recordApiKeyCacheRevision } from "./revisions.ts";
 import {
-  createApiKeyStore,
   type ApiKeyUsageMergeResult,
+  createApiKeyStore,
 } from "./api-key-store.ts";
 
 export type AddApiKeyResult =
@@ -80,7 +80,9 @@ export async function kvGetApiKeyById(id: string): Promise<ApiKey | null> {
 }
 
 export async function kvAddKey(key: string): Promise<AddApiKeyResult> {
-  if (Array.from(state.cachedKeysById.values()).some((item) => item.key === key)) {
+  if (
+    Array.from(state.cachedKeysById.values()).some((item) => item.key === key)
+  ) {
     return { ok: false, code: "duplicate" };
   }
 

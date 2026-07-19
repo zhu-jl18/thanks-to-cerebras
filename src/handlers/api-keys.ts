@@ -1,11 +1,11 @@
 import { adminJsonResponse, adminProblemResponse } from "../http.ts";
 import { maskKey, parseBatchInput } from "../utils.ts";
 import {
+  type AddApiKeyResult,
+  type DeleteApiKeyResult,
   kvAddKey,
   kvDeleteKey,
   kvGetAllKeys,
-  type AddApiKeyResult,
-  type DeleteApiKeyResult,
 } from "../kv/api-keys.ts";
 import { testKey } from "../services/api-keys.ts";
 import { logger } from "../logger.ts";

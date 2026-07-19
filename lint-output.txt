@@ -1,0 +1,13 @@
+[0m[32mTask[0m [0m[36mlint[0m deno lint --rules-include=camelcase main.ts src scripts/*.ts
+[0m[1m[31merror[require-await][0m: [0m[1mAsync arrow function has no 'await' expression or 'await using' declaration.[0m
+  [0m[38;5;12m-->[0m [0m[36m/home/runner/work/thanks-to-cerebras/thanks-to-cerebras/src/__tests__/api-key-kv_test.ts[0m[0m[33m:64:26[0m
+  [0m[38;5;12m | [0m
+[0m[38;5;12m64 | [0m      operation.commit = async () => {
+  [0m[38;5;12m | [0m                         [0m[1m[31m^^^^^[0m
+   [0m[38;5;12m=[0m [0m[1mhint[0m: Remove 'async' keyword from the function or use 'await' expression or 'await using' declaration inside.
+
+  [0m[38;5;12mdocs[0m: https://docs.deno.com/lint/rules/require-await
+
+
+Found 1 problem
+Checked 76 files

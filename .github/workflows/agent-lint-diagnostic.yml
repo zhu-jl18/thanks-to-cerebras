@@ -1,0 +1,33 @@
+name: agent-lint-diagnostic
+
+on:
+  push:
+    branches: [agent/api-key-atomic-unique-claim]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: 2.9.0
+      - name: Capture lint output
+        run: |
+          set +e
+          deno task lint > lint-output.txt 2>&1
+          status=$?
+          echo "$status" > lint-status.txt
+          exit 0
+      - name: Upload lint diagnostics
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-diagnostics
+          path: |
+            lint-output.txt
+            lint-status.txt

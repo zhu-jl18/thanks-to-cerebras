@@ -1,18 +1,10 @@
-import {
-  API_KEY_CACHE_REVISION_KEY,
-  API_KEY_PREFIX,
-  KV_ATOMIC_MAX_RETRIES,
-  PROXY_KEY_AUTH_REFRESH_INTERVAL_MS,
-} from "./constants.ts";
-import { toPersistedApiKey } from "./api-key-record.ts";
+import { PROXY_KEY_AUTH_REFRESH_INTERVAL_MS } from "./constants.ts";
 import { state } from "./state.ts";
 import {
-  getApiKeyCacheRevision,
-  getNextRevisionValue,
-  recordApiKeyCacheRevision,
-} from "./kv/revisions.ts";
-import { kvMergeAllApiKeysIntoCache } from "./kv/api-keys.ts";
-import { waitForKvAtomicRetry } from "./kv/atomic-retry.ts";
+  kvMergeAllApiKeysIntoCache,
+  kvUpdateKey,
+} from "./kv/api-keys.ts";
+import { getApiKeyCacheRevision, recordApiKeyCacheRevision } from "./kv/revisions.ts";
 import { logger } from "./logger.ts";
 
 export function rebuildActiveKeyIds(): void {
@@ -20,8 +12,8 @@ export function rebuildActiveKeyIds(): void {
   keys.sort(
     (a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id),
   );
-  state.cachedActiveKeyIds = keys.filter((k) => k.status === "active").map(
-    (k) => k.id,
+  state.cachedActiveKeyIds = keys.filter((key) => key.status === "active").map(
+    (key) => key.id,
   );
   if (state.cachedActiveKeyIds.length === 0) {
     state.cachedCursor = 0;
@@ -36,8 +28,9 @@ export function getNextApiKeyFast(
   if (state.cachedActiveKeyIds.length === 0) return null;
 
   for (let offset = 0; offset < state.cachedActiveKeyIds.length; offset++) {
-    const idx = (state.cachedCursor + offset) % state.cachedActiveKeyIds.length;
-    const id = state.cachedActiveKeyIds[idx];
+    const index = (state.cachedCursor + offset) %
+      state.cachedActiveKeyIds.length;
+    const id = state.cachedActiveKeyIds[index];
     const cooldownUntil = state.keyCooldownUntil.get(id) ?? 0;
     if (cooldownUntil > now) continue;
 
@@ -47,7 +40,7 @@ export function getNextApiKeyFast(
       throw new Error(`API key ${id} 未解密`);
     }
 
-    state.cachedCursor = (idx + 1) % state.cachedActiveKeyIds.length;
+    state.cachedCursor = (index + 1) % state.cachedActiveKeyIds.length;
 
     keyEntry.useCount += 1;
     keyEntry.lastUsed = now;
@@ -92,10 +85,7 @@ async function refreshApiKeyCacheRevision(): Promise<void> {
   // every refresh attempt fails. See issue #138.
   state.apiKeyCacheRevisionLastCheckedAt = now;
   // Track which phase failed so the warn log distinguishes a KV outage on
-  // the revision read from a failure inside the merge step (which can also
-  // surface key-record format / encryption errors via kvGetAllKeys —
-  // intentionally absorbed here so a single bad record cannot take down
-  // the whole proxy, but operators need to know which path tripped).
+  // the revision read from a failure inside the merge step.
   let phase: "revision_read" | "merge_keys" = "revision_read";
   try {
     const revision = await getApiKeyCacheRevision();
@@ -104,13 +94,8 @@ async function refreshApiKeyCacheRevision(): Promise<void> {
     await kvMergeAllApiKeysIntoCache();
     recordApiKeyCacheRevision(revision);
   } catch (error) {
-    // Swallow KV / hydration errors instead of failing the proxy request:
-    // the existing in-memory cache is still valid for the throttle window.
-    // Without this, a transient KV outage cascades to 500 responses on
-    // every proxy request that happens to fall outside the throttle
-    // window. The phase field lets operators tell a revision-key outage
-    // apart from a merge-time problem (e.g. KV.list error or a
-    // legitimately broken persisted key record).
+    // Preserve the last verified in-memory cache when KV is unavailable or the
+    // persisted record/claim invariant cannot be validated.
     logger.warn("api_key_cache_refresh_failed", { phase }, error);
   }
 }
@@ -125,40 +110,13 @@ export function markKeyCooldownFrom429(id: string, response: Response): void {
 
 export async function markKeyInvalid(id: string): Promise<void> {
   const keyEntry = state.cachedKeysById.get(id);
-  if (!keyEntry) return;
-  if (keyEntry.status === "invalid") return;
+  if (!keyEntry || keyEntry.status === "invalid") return;
+
   keyEntry.status = "invalid";
   state.keyCooldownUntil.delete(id);
   rebuildActiveKeyIds();
   try {
-    const key = [...API_KEY_PREFIX, id];
-    for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
-      const [entry, revisionEntry] = await Promise.all([
-        state.kv.get(key),
-        state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
-      ]);
-      if (!entry.value) {
-        state.cachedKeysById.delete(id);
-        state.keyCooldownUntil.delete(id);
-        state.dirtyKeyIds.delete(id);
-        rebuildActiveKeyIds();
-        return;
-      }
-      const revision = getNextRevisionValue(revisionEntry);
-      const result = await state.kv.atomic()
-        .check(entry)
-        .check(revisionEntry)
-        .set(key, toPersistedApiKey(keyEntry))
-        .set(API_KEY_CACHE_REVISION_KEY, revision)
-        .commit();
-      if (result.ok) {
-        state.dirtyKeyIds.delete(id);
-        recordApiKeyCacheRevision(revision);
-        return;
-      }
-      await waitForKvAtomicRetry(attempt);
-    }
-    throw new Error("API key invalidation write conflict");
+    await kvUpdateKey(id, { status: "invalid" });
   } catch (error) {
     logger.error("api_key_invalidation_write_failed", { keyId: id }, error);
   }

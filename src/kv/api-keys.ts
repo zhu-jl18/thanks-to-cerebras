@@ -20,7 +20,10 @@ import {
   getNextRevisionValue,
   recordApiKeyCacheRevision,
 } from "./revisions.ts";
-import { valueIndexKey } from "./api-keys-index.ts";
+import {
+  kvFindApiKeyValueIndexSuccessor,
+  valueIndexKey,
+} from "./api-keys-index.ts";
 import { waitForKvAtomicRetry } from "./atomic-retry.ts";
 
 async function hydrateApiKey(value: unknown): Promise<ApiKey> {
@@ -196,13 +199,15 @@ export async function kvDeleteKey(
     await decryptApiKey(persisted.encryptedKey);
   const valueDigest = await sha256Hex(plaintext);
   const indexKey = valueIndexKey(valueDigest);
-  // Fetch indexEntry and revisionEntry in parallel — mirrors the
-  // Promise.all pattern in kvAddKey and saves one KV round-trip.
-  const [indexEntry, revisionEntry] = await Promise.all([
-    state.kv.get<string>(indexKey),
-    state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
-  ]);
+  const indexEntry = await state.kv.get<string>(indexKey);
+  const indexSuccessor = indexEntry.value === id
+    ? await kvFindApiKeyValueIndexSuccessor(valueDigest, id)
+    : null;
+  // Read the revision after the optional prefix scan so the CAS window on this
+  // frequently updated slot stays short.
+  const revisionEntry = await state.kv.get<number>(API_KEY_CACHE_REVISION_KEY);
   const revision = getNextRevisionValue(revisionEntry);
+
   // Always CAS the index entry — including the "no entry yet" case for a
   // legacy record. Without this, a concurrent backfill that creates the
   // index between our read and our commit would leave a dangling index
@@ -211,13 +216,20 @@ export async function kvDeleteKey(
   let atomic = state.kv.atomic()
     .check(result)
     .check(indexEntry)
-    .check(revisionEntry)
+    .check(revisionEntry);
+  if (indexSuccessor) {
+    // The successor came from a prefix scan; CAS it before promotion so a
+    // concurrent update or delete cannot turn the index into a stale pointer.
+    atomic = atomic.check(indexSuccessor);
+  }
+  atomic = atomic
     .delete(key)
     .set(API_KEY_CACHE_REVISION_KEY, revision);
   if (indexEntry.value === id) {
-    // Delete the digest index only when this record owns it. If another
-    // id owns the index, leave that duplicate-protection path intact.
-    atomic = atomic.delete(indexKey);
+    // Keep the digest protected continuously while legacy duplicates survive.
+    atomic = indexSuccessor
+      ? atomic.set(indexKey, indexSuccessor.value.id)
+      : atomic.delete(indexKey);
   }
   const deleteResult = await atomic.commit();
   if (!deleteResult.ok) {

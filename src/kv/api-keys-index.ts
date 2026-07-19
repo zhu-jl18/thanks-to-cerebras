@@ -26,17 +26,33 @@ interface ApiKeyValueIndexReplacement {
   entry: Deno.KvEntry<unknown>;
 }
 
+type ApiKeyValueIndexReplacementSearch =
+  | { status: "found"; replacement: ApiKeyValueIndexReplacement }
+  | { status: "not-found" }
+  | { status: "blocked"; candidateId: string };
+
 interface ApiKeyValueIndexReleaseBase {
   indexKey: Deno.KvKey;
   indexEntry: Deno.KvEntryMaybe<string>;
 }
 
+interface ApiKeyValueIndexReleaseBlocked {
+  action: "blocked";
+  candidateId: string;
+}
+
 export type ApiKeyValueIndexReleasePlan =
+  | ApiKeyValueIndexReleaseBlocked
   | (ApiKeyValueIndexReleaseBase & { action: "preserve" | "delete" })
   | (ApiKeyValueIndexReleaseBase & {
     action: "promote";
     replacement: ApiKeyValueIndexReplacement;
   });
+
+type ExecutableApiKeyValueIndexReleasePlan = Exclude<
+  ApiKeyValueIndexReleasePlan,
+  ApiKeyValueIndexReleaseBlocked
+>;
 
 export function valueIndexKey(digest: string): Deno.KvKey {
   return [...API_KEY_VALUE_INDEX_PREFIX, digest];
@@ -45,7 +61,8 @@ export function valueIndexKey(digest: string): Deno.KvKey {
 async function findApiKeyValueIndexReplacement(
   deletingId: string,
   plaintext: string,
-): Promise<ApiKeyValueIndexReplacement | null> {
+): Promise<ApiKeyValueIndexReplacementSearch> {
+  let unreadableCandidateId: string | undefined;
   const iter = state.kv.list({ prefix: API_KEY_PREFIX });
   for await (const entry of iter) {
     const candidateId = entry.key[API_KEY_PREFIX.length];
@@ -60,14 +77,20 @@ async function findApiKeyValueIndexReplacement(
       const persisted = assertCurrentApiKey(entry.value);
       const candidatePlaintext = await decryptApiKey(persisted.encryptedKey);
       if (candidatePlaintext === plaintext) {
-        return { id: candidateId, entry };
+        return {
+          status: "found",
+          replacement: { id: candidateId, entry },
+        };
       }
     } catch (error) {
-      // A malformed unrelated record must not prevent an admin from deleting
-      // a valid key. It cannot safely become the replacement owner, so skip it
-      // and preserve the same diagnostic shape used by cache hydration.
+      // Removing the index requires proving that no same-value record survives.
+      // An unreadable candidate makes that proof incomplete: it may have been
+      // encrypted under another secret or may still contain a legacy plaintext
+      // value. Keep scanning in case a readable replacement exists, but fail
+      // closed if the scan otherwise finds none.
+      unreadableCandidateId ??= candidateId;
       logger.warn(
-        "api_key_value_index_replacement_scan_skipped",
+        "api_key_value_index_replacement_scan_failed",
         {
           keyId: candidateId,
           kvKey: String(entry.key),
@@ -76,15 +99,19 @@ async function findApiKeyValueIndexReplacement(
       );
     }
   }
-  return null;
+
+  return unreadableCandidateId
+    ? { status: "blocked", candidateId: unreadableCandidateId }
+    : { status: "not-found" };
 }
 
 /**
  * Plans the index side of deleting an api-key record.
  *
  * Only the current index owner performs the authoritative KV scan. If a
- * pre-existing same-value duplicate survives, the plan promotes it; otherwise
- * the index is deleted. A record that does not own the index leaves it intact.
+ * pre-existing same-value duplicate survives, the plan promotes it; if the
+ * scan proves none survives, the index is deleted. An unreadable candidate
+ * blocks deletion because the scan cannot safely prove it is unrelated.
  */
 export async function kvPlanApiKeyValueIndexRelease(
   id: string,
@@ -96,20 +123,25 @@ export async function kvPlanApiKeyValueIndexRelease(
 
   if (indexEntry.value !== id) return { ...base, action: "preserve" };
 
-  const replacement = await findApiKeyValueIndexReplacement(id, plaintext);
-  return replacement
-    ? { ...base, action: "promote", replacement }
-    : { ...base, action: "delete" };
+  const search = await findApiKeyValueIndexReplacement(id, plaintext);
+  if (search.status === "found") {
+    return { ...base, action: "promote", replacement: search.replacement };
+  }
+  if (search.status === "blocked") {
+    return { action: "blocked", candidateId: search.candidateId };
+  }
+  return { ...base, action: "delete" };
 }
 
 /**
- * Applies a release plan to the caller's atomic operation. The caller must CAS
- * `plan.indexEntry`; promotion additionally CASes the replacement record so a
- * concurrent delete cannot leave the index pointing at a vanished id.
+ * Applies an executable release plan to the caller's atomic operation. The
+ * caller must CAS `plan.indexEntry`; promotion additionally CASes the
+ * replacement record so a concurrent delete cannot leave the index pointing
+ * at a vanished id.
  */
 export function applyApiKeyValueIndexRelease(
   atomic: KvAtomicOperation,
-  plan: ApiKeyValueIndexReleasePlan,
+  plan: ExecutableApiKeyValueIndexReleasePlan,
 ): KvAtomicOperation {
   switch (plan.action) {
     case "preserve":

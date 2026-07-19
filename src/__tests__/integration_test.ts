@@ -7,6 +7,7 @@ import {
 import { AppState, state } from "../state.ts";
 import { createHandler, createRouter } from "../app.ts";
 import { bootstrapCache, flushDirtyToKv } from "../kv/flush.ts";
+import { createApiKeyStore } from "../kv/api-key-store.ts";
 import { resetKvRateLimitsForTests } from "../rate-limit.ts";
 import { resetProxyStreamCountersForTests } from "../stream-limits.ts";
 import { metrics } from "../metrics.ts";
@@ -1258,8 +1259,8 @@ Deno.test("integration: API key cache evicts stale deleted keys after revision",
   await addActiveApiKey("sk-stale-secret");
   const [apiKeyId] = state.cachedActiveKeyIds;
 
-  await kv.delete([...API_KEY_PREFIX, apiKeyId]);
-  await kv.set(API_KEY_CACHE_REVISION_KEY, Date.now());
+  const deleted = await createApiKeyStore(kv).delete(apiKeyId);
+  if (!deleted.ok) throw new Error(`delete failed: ${deleted.code}`);
   state.apiKeyCacheRevision = 0;
   state.apiKeyCacheRevisionLastCheckedAt = 0;
   await refreshApiKeyCacheIfChanged();

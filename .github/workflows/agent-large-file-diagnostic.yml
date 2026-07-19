@@ -1,0 +1,36 @@
+name: agent-large-file-diagnostic
+
+on:
+  push:
+    branches: [agent/api-key-atomic-unique-claim]
+
+permissions:
+  contents: write
+
+jobs:
+  large-file-diagnostic:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: agent/api-key-atomic-unique-claim
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: 2.9.0
+      - name: Capture large-file output
+        run: |
+          set +e
+          deno task large-files:check > large-file-output.txt 2>&1
+          status=$?
+          echo "$status" > large-file-status.txt
+          exit 0
+      - name: Commit diagnostics
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add large-file-output.txt large-file-status.txt
+          git commit -m "chore(ci): record large-file diagnostics"
+          git push origin HEAD:agent/api-key-atomic-unique-claim

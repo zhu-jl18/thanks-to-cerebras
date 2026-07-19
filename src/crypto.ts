@@ -14,8 +14,8 @@ function constantTimeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== SHA256_BYTES || b.length !== SHA256_BYTES) return false;
 
   let diff = 0;
-  for (let i = 0; i < SHA256_BYTES; i++) {
-    diff |= a[i] ^ b[i];
+  for (let index = 0; index < SHA256_BYTES; index++) {
+    diff |= a[index] ^ b[index];
   }
   return diff === 0;
 }
@@ -27,20 +27,6 @@ async function sha256Bytes(value: string): Promise<Uint8Array> {
       bytesSource(new TextEncoder().encode(value)),
     ),
   );
-}
-
-/**
- * Returns a hex-encoded SHA-256 digest of the input. Used as a stable,
- * non-secret identifier for "have I seen this exact value before?" checks
- * (e.g. the API key value index) without storing the plaintext alongside.
- */
-export async function sha256Hex(value: string): Promise<string> {
-  const bytes = await sha256Bytes(value);
-  let hex = "";
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, "0");
-  }
-  return hex;
 }
 
 export async function compareSecret(a: string, b: string): Promise<boolean> {
@@ -98,8 +84,8 @@ export async function verifyPbkdf2Password(
   let salt: Uint8Array;
   let storedKey: Uint8Array;
   try {
-    salt = Uint8Array.from(atob(parts[3]), (c) => c.charCodeAt(0));
-    storedKey = Uint8Array.from(atob(parts[4]), (c) => c.charCodeAt(0));
+    salt = Uint8Array.from(atob(parts[3]), (char) => char.charCodeAt(0));
+    storedKey = Uint8Array.from(atob(parts[4]), (char) => char.charCodeAt(0));
   } catch {
     return false;
   }
@@ -128,8 +114,8 @@ export async function verifyPbkdf2Password(
   if (computedKey.length !== storedKey.length) return false;
 
   let diff = 0;
-  for (let i = 0; i < computedKey.length; i++) {
-    diff |= computedKey[i] ^ storedKey[i];
+  for (let index = 0; index < computedKey.length; index++) {
+    diff |= computedKey[index] ^ storedKey[index];
   }
   return diff === 0;
 }

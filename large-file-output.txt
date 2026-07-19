@@ -1,2 +1,0 @@
-[0m[32mTask[0m [0m[36mlarge-files:check[0m deno run --allow-read scripts/large-file-check.ts
-Large file check passed: 80 files checked.

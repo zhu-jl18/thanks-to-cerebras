@@ -1,15 +1,18 @@
 name: agent-finalize-api-key-refactor
 
 on:
-  push:
-    branches: [agent/api-key-atomic-unique-claim]
+  pull_request:
+    branches: [main]
+    types: [synchronize]
 
 permissions:
   contents: write
 
 jobs:
   finalize:
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.event.pull_request.head.ref == 'agent/api-key-atomic-unique-claim' &&
+      github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout branch

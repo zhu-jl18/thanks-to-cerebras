@@ -8,22 +8,16 @@ import {
   UPSTREAM_ERROR_BODY_TIMEOUT_MS,
 } from "../constants.ts";
 import { fetchWithTimeout, isAbortError, safeJsonParse } from "../utils.ts";
-import { state } from "../state.ts";
-import {
-  getNextApiKeyFast,
-  markKeyCooldownFrom429,
-  markKeyInvalid,
-  refreshApiKeyCacheIfChanged,
-} from "../api-keys.ts";
+import { markKeyCooldownFrom429, markKeyInvalid } from "../api-keys.ts";
 import {
   getNextModelFast,
   isModelNotFoundPayload,
   isModelNotFoundText,
 } from "../models.ts";
-import { kvMergeAllApiKeysIntoCache } from "../kv/api-keys.ts";
 import { removeModelFromPool } from "../kv/model-catalog.ts";
 import { metrics } from "../metrics.ts";
 import { logger } from "../logger.ts";
+import { selectProxyApiKey } from "./proxy-api-key.ts";
 import {
   getUpstreamCircuitPermit,
   recordUpstreamFailure,
@@ -48,7 +42,6 @@ export type ProxyResult =
   };
 
 type ProxyLogContext = Record<string, string | undefined>;
-type SelectedApiKey = NonNullable<ReturnType<typeof getNextApiKeyFast>>;
 
 function applyStandardHeaders(headers: Headers): void {
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
@@ -144,57 +137,20 @@ function recordCircuitOutcome(status: number): void {
   }
 }
 
-async function selectApiKey(
-  context: ProxyLogContext,
-): Promise<SelectedApiKey | null> {
-  await refreshApiKeyCacheIfChanged();
-  const cached = getNextApiKeyFast(Date.now());
-  if (cached) return cached;
-
-  try {
-    await kvMergeAllApiKeysIntoCache();
-  } catch (error) {
-    // The strict store still rejects malformed record/claim state. The proxy
-    // path contains that failure and continues from the last verified cache.
-    logger.warn(
-      "api_key_cache_refresh_failed",
-      { ...context, phase: "empty_pool_merge" },
-      error,
-    );
-  }
-  return getNextApiKeyFast(Date.now());
-}
-
-function buildNoApiKeyResult(): ProxyResult {
-  const now = Date.now();
-  const cooldowns = state.cachedActiveKeyIds
-    .map((id) => state.keyCooldownUntil.get(id) ?? 0)
-    .filter((ms) => ms > now);
-  const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
-  const retryAfterSec = minCooldownUntil > now
-    ? Math.ceil((minCooldownUntil - now) / 1000)
-    : 0;
-
-  const status = state.cachedActiveKeyIds.length > 0 ? 429 : 500;
-  metrics.inc(
-    "proxy_requests_total",
-    status === 429 ? "no_key_cooldown" : "no_key",
-  );
-  return {
-    kind: "error",
-    message: "没有可用的 API 密钥",
-    status,
-    retryAfterSec: retryAfterSec > 0 ? retryAfterSec : undefined,
-  };
-}
-
 export async function forwardChatCompletion(
   requestBody: Record<string, unknown>,
   context: ProxyLogContext = {},
 ): Promise<ProxyResult> {
-  const apiKeyData = await selectApiKey(context);
-  if (!apiKeyData) return buildNoApiKeyResult();
-
+  const selection = await selectProxyApiKey(context);
+  if (!selection.ok) {
+    return {
+      kind: "error",
+      message: "没有可用的 API 密钥",
+      status: selection.status,
+      retryAfterSec: selection.retryAfterSec,
+    };
+  }
+  const apiKeyData = selection.key;
   let sawModelNotFound = false;
 
   for (let attempt = 0; attempt < MAX_MODEL_NOT_FOUND_RETRIES; attempt++) {
@@ -250,7 +206,6 @@ export async function forwardChatCompletion(
     }
 
     recordCircuitOutcome(apiResponse.status);
-
     let upstreamErrorBodyConsumed = false;
 
     if (apiResponse.status === 404) {
@@ -262,7 +217,6 @@ export async function forwardChatCompletion(
         return buildSanitizedUpstreamError(apiResponse);
       }
       const payload = safeJsonParse(bodyRead.text);
-
       const modelNotFound = isModelNotFoundPayload(payload) ||
         isModelNotFoundText(bodyRead.text);
 
@@ -298,7 +252,6 @@ export async function forwardChatCompletion(
 
     const responseHeaders = new Headers(apiResponse.headers);
     applyStandardHeaders(responseHeaders);
-
     metrics.inc("proxy_requests_total", "success");
     return {
       kind: "upstream",

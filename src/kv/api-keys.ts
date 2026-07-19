@@ -214,17 +214,17 @@ export async function kvDeleteKey(
 
   const revision = getNextRevisionValue(revisionEntry);
 
-  // Always CAS the index snapshot, including a missing legacy entry or an
-  // entry owned by another duplicate. Promotion also CASes the replacement
-  // record before moving ownership, so the transaction cannot create a
-  // dangling index under a concurrent delete.
-  let atomic = state.kv.atomic()
-    .check(result)
-    .check(indexPlan.indexEntry)
-    .check(revisionEntry)
-    .delete(key)
-    .set(API_KEY_CACHE_REVISION_KEY, revision);
-  atomic = applyApiKeyValueIndexRelease(atomic, indexPlan);
+  // The release helper owns the index-snapshot CAS. Promotion additionally
+  // CASes the replacement record, so the transaction cannot install a dangling
+  // index under a concurrent update or delete.
+  const atomic = applyApiKeyValueIndexRelease(
+    state.kv.atomic()
+      .check(result)
+      .check(revisionEntry)
+      .delete(key)
+      .set(API_KEY_CACHE_REVISION_KEY, revision),
+    indexPlan,
+  );
 
   const deleteResult = await atomic.commit();
   if (!deleteResult.ok) {

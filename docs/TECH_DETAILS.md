@@ -18,12 +18,41 @@ Client -> /v1/chat/completions -> Deno Proxy -> Cerebras API
 
 ## 密钥存储
 
-`KEY_ENCRYPTION_SECRET` 是密钥存储主密钥：
+`KEY_ENCRYPTION_SECRET` 是密钥存储根密钥：
 
 - Cerebras API key 使用 AES-GCM 加密后写入
   KV，热路径只在内存缓存中保存解密后的值。
+- 同一根密钥经 HKDF 以 `api-key-fingerprint/v1` 上下文派生独立 HMAC key；
+  `HMAC-SHA-256(plaintext)` 作为部署作用域的 blind fingerprint。
+- 每个 API-key 主记录都带 immutable fingerprint，并由一个
+  `fingerprint -> random id` 唯一 claim 配对。创建和删除在同一个 Deno KV
+  atomic 事务中更新两者，相当于 `UNIQUE(fingerprint)` 约束。
 - 代理访问密钥只在创建响应中返回一次，KV 中只保存 HMAC-SHA-256 哈希。
-- 明文导出接口返回 `403`。旧明文 KV 记录必须通过管理 API 迁移后才能继续使用。
+- 明文导出接口返回 `403`。
+
+API-key store 采用严格 schema，不执行在线迁移或部分自愈。旧 API-key 记录、缺失
+claim、悬空 claim 或 fingerprint/ciphertext 不匹配都会被视为存储 invariant
+损坏；部署前应清空旧 API-key 数据并通过管理 API 重新导入。
+
+## API-key store invariant
+
+对每个 API key，存储必须满足一一对应：
+
+```text
+record[id].fingerprint == fp
+unique[fp] == id
+HMAC(decrypt(record[id].encryptedKey)) == fp
+```
+
+正常 CRUD 均为 O(1)：
+
+- 创建：CAS 空 record slot、空 unique claim 和 cache revision，原子写入三者。
+- 删除：从主记录直接读取 fingerprint，CAS record、claim 和 revision，原子删除前两者。
+- 更新：只更新主记录元数据；fingerprint、ciphertext 和 claim ownership 不变。
+- 多实例添加同值 key 时竞争同一个 claim slot，只有一个事务成功。
+
+全量 `list` 和 cache refresh 会校验 record/claim 双向关系后再解密记录。若 invariant
+不成立，保留最后一次已验证的内存缓存并记录错误，而不是跳过损坏项后继续运行。
 
 ## 鉴权逻辑
 
@@ -91,10 +120,13 @@ isolate、冷启动和多区域部署不会各自拥有独立内存窗口。
 // 管理员密码
 [KV_PREFIX, "meta", "admin_password"] -> string (PBKDF2 hash, v1$pbkdf2$...)
 
-// Cerebras API 密钥
-[KV_PREFIX, "keys", "api", <id>] -> ApiKey {
-  id, encryptedKey, useCount, lastUsed, status, createdAt
+// Cerebras API-key 主记录
+[KV_PREFIX, "keys", "api", <random-id>] -> PersistedApiKey {
+  id, fingerprint, encryptedKey, useCount, lastUsed, status, createdAt
 }
+
+// Cerebras API-key 唯一 claim
+[KV_PREFIX, "keys", "api_unique", "v1", <fingerprint>] -> <random-id>
 
 // 代理访问密钥
 [KV_PREFIX, "keys", "proxy", <id>] -> ProxyAuthKey {
@@ -112,15 +144,17 @@ isolate、冷启动和多区域部署不会各自拥有独立内存窗口。
 }
 ```
 
-升级到当前版本后，如果 KV 中仍是旧配置结构（如包含 `schemaVersion` /
-`disabledModels` 或缺少必填字段），服务会在启动时直接报错；需要先清空
-KV（本地/Docker 删除 `kv.sqlite3`，Deno Deploy 清空项目 KV 数据）再重启。
+升级到当前版本后，如果 KV 中仍是旧 API-key schema 或旧配置结构（如包含
+`schemaVersion` / `disabledModels` 或缺少必填字段），服务会在启动时直接报错；
+需要先清空 KV（本地/Docker 删除 `kv.sqlite3`，Deno Deploy 清空项目 KV 数据）
+再重启并重新导入 API keys。
 
 ## 性能优化
 
 1. **内存缓存** - 热路径不读 KV，直接读内存
-2. **批量刷盘** - 统计信息按间隔批量写入 KV
-3. **流式透传** - 不消费上游响应，直接透传
+2. **O(1) API-key CRUD** - 唯一 claim 消除删除时的 prefix scan 与逐条解密
+3. **批量刷盘** - 统计信息按间隔批量写入 KV
+4. **流式透传** - 不消费上游响应，直接透传
 
 ## KV 写入量估算
 

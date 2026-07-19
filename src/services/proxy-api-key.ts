@@ -1,7 +1,4 @@
-import {
-  getNextApiKeyFast,
-  refreshApiKeyCacheIfChanged,
-} from "../api-keys.ts";
+import { getNextApiKeyFast, refreshApiKeyCacheIfChanged } from "../api-keys.ts";
 import { kvMergeAllApiKeysIntoCache } from "../kv/api-keys.ts";
 import { logger } from "../logger.ts";
 import { metrics } from "../metrics.ts";

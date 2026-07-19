@@ -3,9 +3,22 @@
  * strict one-to-one relation maintained by the same atomic transaction.
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
-import { API_KEY_PREFIX, API_KEY_UNIQUE_PREFIX } from "../constants.ts";
-import { fingerprintApiKey, isApiKeyFingerprint } from "../secrets.ts";
+import {
+  assert,
+  assertEquals,
+  assertNotEquals,
+  assertRejects,
+} from "@std/assert";
+import {
+  API_KEY_CACHE_REVISION_KEY,
+  API_KEY_PREFIX,
+  API_KEY_UNIQUE_PREFIX,
+} from "../constants.ts";
+import {
+  encryptApiKey,
+  fingerprintApiKey,
+  isApiKeyFingerprint,
+} from "../secrets.ts";
 import {
   kvAddKey,
   kvDeleteKey,
@@ -13,7 +26,11 @@ import {
   kvUpdateKey,
 } from "../kv/api-keys.ts";
 import { apiKeyUniqueClaimKey } from "../kv/api-key-store.ts";
+import { kvGetConfig } from "../kv/config.ts";
+import { bootstrapCache, flushDirtyToKv } from "../kv/flush.ts";
+import { getNextRevisionValue } from "../kv/revisions.ts";
 import { setLogSinkForTests } from "../logger.ts";
+import { metrics } from "../metrics.ts";
 import { AppState, state } from "../state.ts";
 
 async function setupKv(): Promise<Deno.Kv> {
@@ -41,6 +58,59 @@ async function countPrefix(prefix: Deno.KvKey): Promise<number> {
   return count;
 }
 
+function sameKey(left: Deno.KvKey, right: readonly unknown[]): boolean {
+  return left.length === right.length &&
+    left.every((part, index) => part === right[index]);
+}
+
+function installKvGetInterceptor(
+  beforeGet: (kv: Deno.Kv, key: Deno.KvKey) => Promise<void>,
+): { restore: () => void } {
+  const original = state.kv;
+  state.kv = new Proxy(original, {
+    get(target, property) {
+      if (property === "get") {
+        return async (key: Deno.KvKey, ...rest: unknown[]) => {
+          await beforeGet(target, key);
+          return (target.get as unknown as (
+            key: Deno.KvKey,
+            ...rest: unknown[]
+          ) => Promise<unknown>).call(target, key, ...rest);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Deno.Kv;
+
+  return {
+    restore: () => {
+      state.kv = original;
+    },
+  };
+}
+
+function installConcurrentDeleteOnClaimRead(
+  id: string,
+  claimKey: Deno.KvKey,
+): { restore: () => void; raced: () => boolean } {
+  const recordKey = [...API_KEY_PREFIX, id];
+  let raced = false;
+  const interceptor = installKvGetInterceptor(async (kv, key) => {
+    if (raced || !sameKey(key, claimKey)) return;
+
+    raced = true;
+    const revisionEntry = await kv.get<number>(API_KEY_CACHE_REVISION_KEY);
+    const revision = getNextRevisionValue(revisionEntry);
+    await kv.atomic()
+      .delete(recordKey)
+      .delete(claimKey)
+      .set(API_KEY_CACHE_REVISION_KEY, revision)
+      .commit();
+  });
+  return { ...interceptor, raced: () => raced };
+}
+
 Deno.test("fingerprintApiKey: deterministic, keyed, and non-revealing", async () => {
   Deno.env.set("KEY_ENCRYPTION_SECRET", "fingerprint-secret-a");
   const first = await fingerprintApiKey("sk-fingerprint-value");
@@ -51,11 +121,60 @@ Deno.test("fingerprintApiKey: deterministic, keyed, and non-revealing", async ()
   const differentDeployment = await fingerprintApiKey("sk-fingerprint-value");
 
   assertEquals(first, second);
-  assertEquals(first !== differentValue, true);
-  assertEquals(first !== differentDeployment, true);
-  assertEquals(isApiKeyFingerprint(first), true);
+  assertNotEquals(first, differentValue);
+  assertNotEquals(first, differentDeployment);
+  assert(isApiKeyFingerprint(first));
   assertEquals(first.includes("sk-fingerprint-value"), false);
 });
+
+Deno.test(
+  "kvGetAllKeys: retries a full scan when its revision changes",
+  async () => {
+    const kv = await setupKv();
+    const id = crypto.randomUUID();
+    const plaintext = "sk-created-during-scan";
+    const [fingerprint, encryptedKey] = await Promise.all([
+      fingerprintApiKey(plaintext),
+      encryptApiKey(plaintext),
+    ]);
+    let revisionReads = 0;
+    let raced = false;
+    const interceptor = installKvGetInterceptor(async (store, key) => {
+      if (!sameKey(key, API_KEY_CACHE_REVISION_KEY)) return;
+
+      revisionReads++;
+      if (revisionReads !== 2 || raced) return;
+
+      raced = true;
+      const revisionEntry = await store.get<number>(
+        API_KEY_CACHE_REVISION_KEY,
+      );
+      const revision = getNextRevisionValue(revisionEntry);
+      await store.atomic()
+        .set([...API_KEY_PREFIX, id], {
+          id,
+          fingerprint,
+          encryptedKey,
+          useCount: 0,
+          status: "active",
+          createdAt: 1,
+        })
+        .set(apiKeyUniqueClaimKey(fingerprint), id)
+        .set(API_KEY_CACHE_REVISION_KEY, revision)
+        .commit();
+    });
+
+    try {
+      const keys = await kvGetAllKeys();
+      assert(raced);
+      assertEquals(keys.map((key) => key.id), [id]);
+    } finally {
+      interceptor.restore();
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
 
 Deno.test(
   "kvAddKey: atomically creates one record and one unique claim",
@@ -157,6 +276,66 @@ Deno.test(
     } finally {
       kv.list = originalList;
       Deno.env.set("KEY_ENCRYPTION_SECRET", "test-key-encryption-secret");
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
+  "kvDeleteKey: concurrent valid deletion is not reported as corruption",
+  async () => {
+    const kv = await setupKv();
+    const id = await requireCreated("sk-concurrent-delete");
+    const record = await kv.get<Record<string, unknown>>([
+      ...API_KEY_PREFIX,
+      id,
+    ]);
+    const fingerprint = record.value?.fingerprint;
+    if (typeof fingerprint !== "string") throw new Error("fingerprint missing");
+    const race = installConcurrentDeleteOnClaimRead(
+      id,
+      apiKeyUniqueClaimKey(fingerprint),
+    );
+
+    try {
+      assertEquals(await kvDeleteKey(id), {
+        ok: false,
+        code: "not-found",
+      });
+      assert(race.raced());
+    } finally {
+      race.restore();
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
+  "kvUpdateKey: concurrent valid deletion is not reported as corruption",
+  async () => {
+    const kv = await setupKv();
+    const id = await requireCreated("sk-concurrent-update-delete");
+    const record = await kv.get<Record<string, unknown>>([
+      ...API_KEY_PREFIX,
+      id,
+    ]);
+    const fingerprint = record.value?.fingerprint;
+    if (typeof fingerprint !== "string") throw new Error("fingerprint missing");
+    const race = installConcurrentDeleteOnClaimRead(
+      id,
+      apiKeyUniqueClaimKey(fingerprint),
+    );
+
+    try {
+      assertEquals(await kvUpdateKey(id, { status: "inactive" }), {
+        updated: false,
+      });
+      assert(race.raced());
+      assertEquals(state.cachedKeysById.has(id), false);
+    } finally {
+      race.restore();
       setLogSinkForTests(null);
       kv.close();
     }
@@ -343,6 +522,46 @@ Deno.test(
         true,
       );
       assertEquals((await kv.get<string>(claimKey)).value, "concurrent-owner");
+    } finally {
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
+  "flushDirtyToKv: one corrupt API-key record does not block config flush",
+  async () => {
+    const kv = await setupKv();
+    await bootstrapCache();
+    try {
+      const id = await requireCreated("sk-corrupt-usage-flush");
+      const record = await kv.get<Record<string, unknown>>([
+        ...API_KEY_PREFIX,
+        id,
+      ]);
+      const fingerprint = record.value?.fingerprint;
+      if (typeof fingerprint !== "string") {
+        throw new Error("fingerprint missing");
+      }
+      await kv.set(apiKeyUniqueClaimKey(fingerprint), "wrong-owner");
+
+      const cached = state.cachedKeysById.get(id);
+      if (!cached) throw new Error("cached key missing");
+      cached.useCount = 7;
+      state.dirtyKeyIds.add(id);
+      state.addPendingTotalRequests(3);
+      state.dirtyConfig = true;
+
+      await flushDirtyToKv();
+
+      assertEquals(state.pendingTotalRequests, 0);
+      assertEquals((await kvGetConfig()).totalRequests, 3);
+      assertEquals(state.dirtyKeyIds.has(id), false);
+      assertEquals(
+        metrics.snapshot().api_key_usage_flush_total?.store_corrupt,
+        1,
+      );
     } finally {
       setLogSinkForTests(null);
       kv.close();

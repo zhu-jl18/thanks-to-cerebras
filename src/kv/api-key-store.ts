@@ -19,11 +19,10 @@ import {
   assertApiKeyMetadata,
   assertApiKeyRecordEntry,
   hydrateApiKeyRecord,
-  loadVerifiedApiKey,
   loadVerifiedApiKeys,
 } from "./api-key-store-schema.ts";
 
-export { apiKeyUniqueClaimKey } from "./api-key-store-schema.ts";
+export { ApiKeyStoreInvariantError, apiKeyUniqueClaimKey };
 
 export type ApiKeyStoreCreateResult =
   | { ok: true; key: ApiKey; revision: number }
@@ -80,6 +79,20 @@ function corruptResult(
   throw error;
 }
 
+type ObservedRecordState = "missing" | "changed" | "unchanged";
+
+async function observeRecordState(
+  kv: Deno.Kv,
+  recordKey: Deno.KvKey,
+  observed: Deno.KvEntryMaybe<unknown>,
+): Promise<ObservedRecordState> {
+  const latest = await kv.get<unknown>(recordKey);
+  if (latest.value === null) return "missing";
+  return latest.versionstamp === observed.versionstamp
+    ? "unchanged"
+    : "changed";
+}
+
 class DenoKvApiKeyStore implements ApiKeyStore {
   constructor(private readonly kv: Deno.Kv) {}
 
@@ -87,8 +100,34 @@ class DenoKvApiKeyStore implements ApiKeyStore {
     return loadVerifiedApiKeys(this.kv);
   }
 
-  get(id: string): Promise<ApiKey | null> {
-    return loadVerifiedApiKey(this.kv, id);
+  async get(id: string): Promise<ApiKey | null> {
+    const recordKey = apiKeyRecordKey(id);
+    for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
+      const recordEntry = await this.kv.get<unknown>(recordKey);
+      if (recordEntry.value === null) return null;
+
+      const persisted = assertApiKeyRecordEntry(recordEntry, id);
+      const claimEntry = await this.kv.get<string>(
+        apiKeyUniqueClaimKey(persisted.fingerprint),
+      );
+      if (claimEntry.value !== id) {
+        const recordState = await observeRecordState(
+          this.kv,
+          recordKey,
+          recordEntry,
+        );
+        if (recordState === "missing") return null;
+        if (recordState === "changed") {
+          await waitForKvAtomicRetry(attempt);
+          continue;
+        }
+        throw new ApiKeyStoreInvariantError(
+          "record is not owned by its unique claim",
+        );
+      }
+      return hydrateApiKeyRecord(persisted);
+    }
+    throw new Error("API key read conflict: reached retry limit");
   }
 
   async create(plaintext: string): Promise<ApiKeyStoreCreateResult> {
@@ -156,6 +195,18 @@ class DenoKvApiKeyStore implements ApiKeyStore {
         this.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
       ]);
       if (claimEntry.value !== id) {
+        const recordState = await observeRecordState(
+          this.kv,
+          recordKey,
+          recordEntry,
+        );
+        if (recordState === "missing") {
+          return { ok: false, code: "not-found" };
+        }
+        if (recordState === "changed") {
+          await waitForKvAtomicRetry(attempt);
+          continue;
+        }
         return { ok: false, code: "store-corrupt" };
       }
 
@@ -184,10 +235,8 @@ class DenoKvApiKeyStore implements ApiKeyStore {
       if (recordEntry.value === null) return { ok: false, code: "not-found" };
 
       let persisted: PersistedApiKey;
-      let current: ApiKey;
       try {
         persisted = assertApiKeyRecordEntry(recordEntry, id);
-        current = await hydrateApiKeyRecord(persisted);
       } catch (error) {
         return corruptResult(error);
       }
@@ -197,9 +246,27 @@ class DenoKvApiKeyStore implements ApiKeyStore {
         this.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
       ]);
       if (claimEntry.value !== id) {
+        const recordState = await observeRecordState(
+          this.kv,
+          recordKey,
+          recordEntry,
+        );
+        if (recordState === "missing") {
+          return { ok: false, code: "not-found" };
+        }
+        if (recordState === "changed") {
+          await waitForKvAtomicRetry(attempt);
+          continue;
+        }
         return { ok: false, code: "store-corrupt" };
       }
 
+      let current: ApiKey;
+      try {
+        current = await hydrateApiKeyRecord(persisted);
+      } catch (error) {
+        return corruptResult(error);
+      }
       const metadata = mutate(current);
       assertApiKeyMetadata(metadata);
       const updatedPersisted: PersistedApiKey = {
@@ -240,6 +307,9 @@ class DenoKvApiKeyStore implements ApiKeyStore {
       apiKeyUniqueClaimKey(persisted.fingerprint),
     );
     if (claimEntry.value !== id) {
+      const recordState = await observeRecordState(this.kv, recordKey, entry);
+      if (recordState === "missing") return "missing";
+      if (recordState === "changed") return "conflict";
       throw new ApiKeyStoreInvariantError(
         "record is not owned by its unique claim",
       );

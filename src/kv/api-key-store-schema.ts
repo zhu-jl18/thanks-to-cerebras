@@ -3,12 +3,18 @@ import {
   assertPersistedApiKey,
   type PersistedApiKey,
 } from "../api-key-record.ts";
-import { API_KEY_PREFIX, API_KEY_UNIQUE_PREFIX } from "../constants.ts";
+import {
+  API_KEY_CACHE_REVISION_KEY,
+  API_KEY_PREFIX,
+  API_KEY_UNIQUE_PREFIX,
+  KV_ATOMIC_MAX_RETRIES,
+} from "../constants.ts";
 import {
   decryptApiKey,
   fingerprintApiKey,
   isApiKeyFingerprint,
 } from "../secrets.ts";
+import { waitForKvAtomicRetry } from "./atomic-retry.ts";
 
 export type ApiKeyMetadata = Pick<
   ApiKey,
@@ -116,7 +122,12 @@ export function assertApiKeyMetadata(metadata: ApiKeyMetadata): void {
   }
 }
 
-export async function loadVerifiedApiKeys(kv: Deno.Kv): Promise<ApiKey[]> {
+interface ApiKeyStoreSnapshot {
+  recordsByFingerprint: Map<string, PersistedApiKey>;
+  claimsByFingerprint: Map<string, string>;
+}
+
+async function scanApiKeyStore(kv: Deno.Kv): Promise<ApiKeyStoreSnapshot> {
   const recordsByFingerprint = new Map<string, PersistedApiKey>();
   const recordIter = kv.list<unknown>({ prefix: API_KEY_PREFIX });
   for await (const entry of recordIter) {
@@ -136,7 +147,13 @@ export async function loadVerifiedApiKeys(kv: Deno.Kv): Promise<ApiKey[]> {
     }
     claimsByFingerprint.set(fingerprint, entry.value);
   }
+  return { recordsByFingerprint, claimsByFingerprint };
+}
 
+function verifyApiKeyStoreSnapshot(
+  snapshot: ApiKeyStoreSnapshot,
+): PersistedApiKey[] {
+  const { recordsByFingerprint, claimsByFingerprint } = snapshot;
   if (recordsByFingerprint.size !== claimsByFingerprint.size) {
     invariant("record and unique-claim counts differ");
   }
@@ -150,27 +167,22 @@ export async function loadVerifiedApiKeys(kv: Deno.Kv): Promise<ApiKey[]> {
       invariant("unique claim is dangling or points at the wrong record");
     }
   }
-
-  const keys: ApiKey[] = [];
-  for (const persisted of recordsByFingerprint.values()) {
-    keys.push(await hydrateApiKeyRecord(persisted));
-  }
-  return keys;
+  return Array.from(recordsByFingerprint.values());
 }
 
-export async function loadVerifiedApiKey(
-  kv: Deno.Kv,
-  id: string,
-): Promise<ApiKey | null> {
-  const recordEntry = await kv.get<unknown>(apiKeyRecordKey(id));
-  if (recordEntry.value === null) return null;
+export async function loadVerifiedApiKeys(kv: Deno.Kv): Promise<ApiKey[]> {
+  for (let attempt = 0; attempt < KV_ATOMIC_MAX_RETRIES; attempt++) {
+    const revisionBefore = await kv.get<number>(API_KEY_CACHE_REVISION_KEY);
+    const snapshot = await scanApiKeyStore(kv);
+    const revisionAfter = await kv.get<number>(API_KEY_CACHE_REVISION_KEY);
 
-  const persisted = assertApiKeyRecordEntry(recordEntry, id);
-  const claimEntry = await kv.get<string>(
-    apiKeyUniqueClaimKey(persisted.fingerprint),
-  );
-  if (claimEntry.value !== id) {
-    invariant("record is not owned by its unique claim");
+    if (revisionBefore.versionstamp !== revisionAfter.versionstamp) {
+      await waitForKvAtomicRetry(attempt);
+      continue;
+    }
+
+    const persistedKeys = verifyApiKeyStoreSnapshot(snapshot);
+    return Promise.all(persistedKeys.map(hydrateApiKeyRecord));
   }
-  return hydrateApiKeyRecord(persisted);
+  throw new Error("API key store changed during every full-read attempt");
 }

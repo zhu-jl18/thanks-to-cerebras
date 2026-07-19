@@ -33,12 +33,16 @@ function bytesSource(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   return new Uint8Array(bytes);
 }
 
-function secretMaterial(): Uint8Array {
+function encryptionSecret(): string {
   const secret = Deno.env.get("KEY_ENCRYPTION_SECRET")?.trim();
   if (!secret) {
     throw new Error("KEY_ENCRYPTION_SECRET 未配置，禁止写入或读取密钥");
   }
-  return encoder.encode(secret);
+  return secret;
+}
+
+function secretMaterial(): Uint8Array {
+  return encoder.encode(encryptionSecret());
 }
 
 export function assertKeyEncryptionSecretConfigured(): void {
@@ -64,10 +68,17 @@ function deriveProxyHmacKey(): Promise<CryptoKey> {
   );
 }
 
-async function deriveApiKeyFingerprintKey(): Promise<CryptoKey> {
+interface ApiKeyFingerprintKeyCache {
+  secret: string;
+  keyPromise: Promise<CryptoKey>;
+}
+
+let apiKeyFingerprintKeyCache: ApiKeyFingerprintKeyCache | null = null;
+
+async function importApiKeyFingerprintKey(secret: string): Promise<CryptoKey> {
   const rootKey = await crypto.subtle.importKey(
     "raw",
-    bytesSource(secretMaterial()),
+    bytesSource(encoder.encode(secret)),
     "HKDF",
     false,
     ["deriveBits"],
@@ -89,6 +100,22 @@ async function deriveApiKeyFingerprintKey(): Promise<CryptoKey> {
     false,
     ["sign"],
   );
+}
+
+function deriveApiKeyFingerprintKey(): Promise<CryptoKey> {
+  const secret = encryptionSecret();
+  if (apiKeyFingerprintKeyCache?.secret === secret) {
+    return apiKeyFingerprintKeyCache.keyPromise;
+  }
+
+  const keyPromise = importApiKeyFingerprintKey(secret).catch((error) => {
+    if (apiKeyFingerprintKeyCache?.keyPromise === keyPromise) {
+      apiKeyFingerprintKeyCache = null;
+    }
+    throw error;
+  });
+  apiKeyFingerprintKeyCache = { secret, keyPromise };
+  return keyPromise;
 }
 
 export function isEncryptedApiKey(value: string): boolean {

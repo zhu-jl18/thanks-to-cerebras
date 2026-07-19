@@ -108,15 +108,17 @@ export async function kvUpdateKey(
   id: string,
   updates: ApiKeyUpdate,
 ): Promise<{ updated: boolean }> {
-  const local = state.cachedKeysById.get(id);
-  const result = await store().update(id, (current) => ({
-    status: updates.status ??
-      (local?.status === "invalid" ? "invalid" : current.status),
-    useCount: updates.useCount ??
-      Math.max(local?.useCount ?? 0, current.useCount),
-    lastUsed: updates.lastUsed ??
-      (Math.max(local?.lastUsed ?? 0, current.lastUsed ?? 0) || undefined),
-  }));
+  const result = await store().update(id, (current) => {
+    const local = state.cachedKeysById.get(id);
+    return {
+      status: updates.status ??
+        (local?.status === "invalid" ? "invalid" : current.status),
+      useCount: updates.useCount ??
+        Math.max(local?.useCount ?? 0, current.useCount),
+      lastUsed: updates.lastUsed ??
+        (Math.max(local?.lastUsed ?? 0, current.lastUsed ?? 0) || undefined),
+    };
+  });
 
   if (!result.ok) {
     if (result.code === "not-found") {

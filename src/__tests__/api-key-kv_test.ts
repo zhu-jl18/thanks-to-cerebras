@@ -51,6 +51,52 @@ Deno.test(
 );
 
 Deno.test(
+  "kvUpdateKey: retries against the latest cache object",
+  async () => {
+    const kv = await setupKv();
+    const id = await addTestApiKey("sk-retry-fresh-cache");
+    const originalAtomic = kv.atomic.bind(kv);
+    let failedOnce = false;
+
+    kv.atomic = () => {
+      const operation = originalAtomic();
+      const originalCommit = operation.commit.bind(operation);
+      operation.commit = async () => {
+        if (!failedOnce) {
+          failedOnce = true;
+          const cached = state.cachedKeysById.get(id);
+          if (!cached) throw new Error("cached key missing");
+          state.cachedKeysById.set(id, {
+            ...cached,
+            useCount: 9,
+            lastUsed: 1_234,
+          });
+          return { ok: false } as unknown as Deno.KvCommitResult;
+        }
+        return originalCommit();
+      };
+      return operation;
+    };
+
+    try {
+      assertEquals(await kvUpdateKey(id, { status: "inactive" }), {
+        updated: true,
+      });
+      const persisted = await kv.get<Record<string, unknown>>([
+        ...API_KEY_PREFIX,
+        id,
+      ]);
+      assertEquals(persisted.value?.useCount, 9);
+      assertEquals(persisted.value?.lastUsed, 1_234);
+    } finally {
+      kv.atomic = originalAtomic;
+      setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
   "kvUpdateKey: returns updated false and cleans cache when record is missing",
   async () => {
     const kv = await setupKv();

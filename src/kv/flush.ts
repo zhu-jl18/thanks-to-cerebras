@@ -15,6 +15,7 @@ import {
   kvUpdateConfig,
   resolveKvFlushIntervalMs,
 } from "./config.ts";
+import { ApiKeyStoreInvariantError } from "./api-key-store.ts";
 import { kvGetAllKeys, kvMergeApiKeyUsage } from "./api-keys.ts";
 import { kvGetAllProxyKeys } from "./proxy-keys.ts";
 import { getApiKeyCacheRevision, getAuthCacheRevision } from "./revisions.ts";
@@ -46,12 +47,21 @@ async function flushApiKeyStats(id: string): Promise<void> {
   const keyEntry = state.cachedKeysById.get(id);
   if (!keyEntry) return;
 
-  const result = await kvMergeApiKeyUsage(
-    id,
-    keyEntry.useCount,
-    keyEntry.lastUsed,
-  );
-  if (result === "conflict") state.dirtyKeyIds.add(id);
+  try {
+    const result = await kvMergeApiKeyUsage(
+      id,
+      keyEntry.useCount,
+      keyEntry.lastUsed,
+    );
+    if (result === "conflict") state.dirtyKeyIds.add(id);
+  } catch (error) {
+    if (!(error instanceof ApiKeyStoreInvariantError)) throw error;
+
+    // Repeating the same stats write cannot repair a broken record/claim
+    // invariant. Isolate the bad key so unrelated stats and config still flush.
+    metrics.inc("api_key_usage_flush_total", "store_corrupt");
+    logger.error("api_key_usage_flush_store_corrupt", { keyId: id }, error);
+  }
 }
 
 /**
@@ -163,7 +173,11 @@ export async function flushDirtyToKv(): Promise<void> {
  * weakening duplicate protection.
  */
 export async function bootstrapCache(): Promise<void> {
-  state.cachedConfig = await kvGetConfig();
+  const [config, apiKeyRevision] = await Promise.all([
+    kvGetConfig(),
+    getApiKeyCacheRevision(),
+  ]);
+  state.cachedConfig = config;
   const keys = await kvGetAllKeys();
   state.cachedKeysById = new Map(keys.map((key) => [key.id, key]));
   rebuildActiveKeyIds();
@@ -174,6 +188,9 @@ export async function bootstrapCache(): Promise<void> {
   state.proxyKeyCacheLastLoadedAt = Date.now();
   state.authCacheRevision = await getAuthCacheRevision();
   state.authCacheRevisionLastCheckedAt = Date.now();
-  state.apiKeyCacheRevision = await getApiKeyCacheRevision();
+  // Keep the revision at or behind the loaded snapshot. A mutation after the
+  // initial read is observed by the normal refresh path instead of being hidden
+  // behind a newer revision than the cache actually contains.
+  state.apiKeyCacheRevision = apiKeyRevision;
   state.apiKeyCacheRevisionLastCheckedAt = Date.now();
 }

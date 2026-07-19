@@ -12,13 +12,17 @@ import {
 } from "../constants.ts";
 import { createHandler, createRouter } from "../app.ts";
 import { refreshApiKeyCacheIfChanged } from "../api-keys.ts";
-import { createApiKeyStore } from "../kv/api-key-store.ts";
+import {
+  apiKeyUniqueClaimKey,
+  createApiKeyStore,
+} from "../kv/api-key-store.ts";
 import { bootstrapCache } from "../kv/flush.ts";
 import { metrics } from "../metrics.ts";
 import { resetKvRateLimitsForTests } from "../rate-limit.ts";
 import { resetProxyStreamCountersForTests } from "../stream-limits.ts";
 import { AppState, state } from "../state.ts";
 import { setLogSinkForTests } from "../logger.ts";
+import { fingerprintApiKey } from "../secrets.ts";
 import { addTestApiKey } from "./api-key-test-helpers.ts";
 
 async function setupKv(): Promise<Deno.Kv> {
@@ -252,6 +256,43 @@ Deno.test(
       globalThis.fetch = originalFetch;
       fail.restore();
       setLogSinkForTests(null);
+      kv.close();
+    }
+  },
+);
+
+Deno.test(
+  "proxy empty-pool refresh contains strict store verification failures",
+  async () => {
+    const kv = await setupKv();
+    const handler = createHandler(createRouter());
+    state.cachedConfig = { ...state.cachedConfig!, proxyPublicAccess: true };
+    const fingerprint = await fingerprintApiKey("sk-dangling-empty-pool");
+    await kv.set(apiKeyUniqueClaimKey(fingerprint), "missing-owner");
+    const logs = captureLogs();
+
+    try {
+      const response = await handler(
+        new Request("http://localhost/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        }),
+      );
+      const body = await response.json();
+
+      assertEquals(response.status, 500);
+      assertEquals(body.error, "没有可用的 API 密钥");
+      const warnings = logs.records.filter((item) =>
+        item.level === "warn" &&
+        item.record.event === "api_key_cache_refresh_failed" &&
+        item.record.phase === "empty_pool_merge"
+      );
+      assertEquals(warnings.length, 1);
+    } finally {
+      logs.restore();
       kv.close();
     }
   },

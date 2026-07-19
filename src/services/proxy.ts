@@ -150,7 +150,18 @@ export async function forwardChatCompletion(
   await refreshApiKeyCacheIfChanged();
   let apiKeyData = getNextApiKeyFast(Date.now());
   if (!apiKeyData) {
-    await kvMergeAllApiKeysIntoCache();
+    try {
+      await kvMergeAllApiKeysIntoCache();
+    } catch (error) {
+      // A forced refresh must preserve the last verified cache just like the
+      // revision-driven refresh path. Persistent invariant failures are logged
+      // but must not escape through the proxy request path.
+      logger.warn(
+        "api_key_cache_refresh_failed",
+        { ...context, phase: "empty_pool_merge" },
+        error,
+      );
+    }
     apiKeyData = getNextApiKeyFast(Date.now());
   }
   if (!apiKeyData) {

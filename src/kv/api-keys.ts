@@ -20,7 +20,11 @@ import {
   getNextRevisionValue,
   recordApiKeyCacheRevision,
 } from "./revisions.ts";
-import { valueIndexKey } from "./api-keys-index.ts";
+import {
+  applyApiKeyValueIndexRelease,
+  kvPlanApiKeyValueIndexRelease,
+  valueIndexKey,
+} from "./api-keys-index.ts";
 import { waitForKvAtomicRetry } from "./atomic-retry.ts";
 
 async function hydrateApiKey(value: unknown): Promise<ApiKey> {
@@ -187,38 +191,41 @@ export async function kvDeleteKey(
   // diagnosable TypeError on the next property access.
   const persisted = assertCurrentApiKey(result.value);
 
-  // Resolve the value digest so the secondary index entry can be removed
-  // atomically alongside the main record. Prefer the in-memory plaintext
-  // (avoid one decrypt round-trip) and fall back to decrypting the
-  // persisted record if the cache doesn't have it.
+  // The index module owns digest resolution and the exceptional legacy-
+  // duplicate scan. The delete path only consumes its release plan.
   const cached = state.cachedKeysById.get(id);
   const plaintext = cached?.key ??
     await decryptApiKey(persisted.encryptedKey);
-  const valueDigest = await sha256Hex(plaintext);
-  const indexKey = valueIndexKey(valueDigest);
-  // Fetch indexEntry and revisionEntry in parallel — mirrors the
-  // Promise.all pattern in kvAddKey and saves one KV round-trip.
-  const [indexEntry, revisionEntry] = await Promise.all([
-    state.kv.get<string>(indexKey),
+  const [indexPlan, revisionEntry] = await Promise.all([
+    kvPlanApiKeyValueIndexRelease(id, plaintext),
     state.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
   ]);
-  const revision = getNextRevisionValue(revisionEntry);
-  // Always CAS the index entry — including the "no entry yet" case for a
-  // legacy record. Without this, a concurrent backfill that creates the
-  // index between our read and our commit would leave a dangling index
-  // pointing at the just-deleted id, permanently locking that plaintext
-  // value out of future kvAddKey calls.
-  let atomic = state.kv.atomic()
-    .check(result)
-    .check(indexEntry)
-    .check(revisionEntry)
-    .delete(key)
-    .set(API_KEY_CACHE_REVISION_KEY, revision);
-  if (indexEntry.value === id) {
-    // Delete the digest index only when this record owns it. If another
-    // id owns the index, leave that duplicate-protection path intact.
-    atomic = atomic.delete(indexKey);
+  if (indexPlan.action === "blocked") {
+    // Removing the owner would erase the only known protection while an
+    // unreadable record might still contain the same plaintext. Abort without
+    // mutating either the owner or the index; a later retry can succeed after
+    // the candidate is repaired, migrated, or removed.
+    logger.warn("api_key_value_index_release_blocked", {
+      keyId: id,
+      candidateId: indexPlan.candidateId,
+    });
+    return { success: false, error: "密钥删除失败，请重试" };
   }
+
+  const revision = getNextRevisionValue(revisionEntry);
+
+  // The release helper owns the index-snapshot CAS. Promotion additionally
+  // CASes the replacement record, so the transaction cannot install a dangling
+  // index under a concurrent update or delete.
+  const atomic = applyApiKeyValueIndexRelease(
+    state.kv.atomic()
+      .check(result)
+      .check(revisionEntry)
+      .delete(key)
+      .set(API_KEY_CACHE_REVISION_KEY, revision),
+    indexPlan,
+  );
+
   const deleteResult = await atomic.commit();
   if (!deleteResult.ok) {
     return { success: false, error: "密钥删除失败，请重试" };

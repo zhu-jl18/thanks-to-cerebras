@@ -36,7 +36,8 @@ Before deploying this version over an existing store:
    source; plaintext export from the application remains disabled.
 2. Stop traffic and back up KV.
 3. Remove old API-key records and old API-key value-index entries, or clear the
-   entire KV store when a full reset is acceptable.
+   entire KV store when a full reset is acceptable. Never retain only one side
+   of a record/index pair: the new store treats partial cleanup as corruption.
 4. Deploy with the intended stable `KEY_ENCRYPTION_SECRET`.
 5. Re-import API keys through `POST /api/keys` or `POST /api/keys/batch`.
 6. Confirm `/readyz`, `/api/keys`, and a test proxy request succeed before

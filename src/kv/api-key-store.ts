@@ -1,29 +1,29 @@
 import type { ApiKey } from "../types.ts";
 import {
-  assertPersistedApiKey,
   createPersistedApiKey,
   type PersistedApiKey,
 } from "../api-key-record.ts";
 import {
   API_KEY_CACHE_REVISION_KEY,
-  API_KEY_PREFIX,
-  API_KEY_UNIQUE_PREFIX,
   KV_ATOMIC_MAX_RETRIES,
 } from "../constants.ts";
-import {
-  decryptApiKey,
-  encryptApiKey,
-  fingerprintApiKey,
-  isApiKeyFingerprint,
-} from "../secrets.ts";
+import { encryptApiKey, fingerprintApiKey } from "../secrets.ts";
 import { generateId } from "../utils.ts";
 import { waitForKvAtomicRetry } from "./atomic-retry.ts";
 import { getNextRevisionValue } from "./revisions.ts";
+import {
+  apiKeyRecordKey,
+  apiKeyUniqueClaimKey,
+  type ApiKeyMetadata,
+  assertApiKeyMetadata,
+  assertApiKeyRecordEntry,
+  ApiKeyStoreInvariantError,
+  hydrateApiKeyRecord,
+  loadVerifiedApiKey,
+  loadVerifiedApiKeys,
+} from "./api-key-store-schema.ts";
 
-export type ApiKeyMetadata = Pick<
-  ApiKey,
-  "status" | "useCount" | "lastUsed"
->;
+export { apiKeyUniqueClaimKey } from "./api-key-store-schema.ts";
 
 export type ApiKeyStoreCreateResult =
   | { ok: true; key: ApiKey; revision: number }
@@ -61,96 +61,6 @@ export interface ApiKeyStore {
   ): Promise<ApiKeyUsageMergeResult>;
 }
 
-export class ApiKeyStoreInvariantError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
-    super(`API key store invariant violated: ${message}`, options);
-    this.name = "ApiKeyStoreInvariantError";
-  }
-}
-
-export function apiKeyRecordKey(id: string): Deno.KvKey {
-  return [...API_KEY_PREFIX, id];
-}
-
-export function apiKeyUniqueClaimKey(fingerprint: string): Deno.KvKey {
-  return [...API_KEY_UNIQUE_PREFIX, fingerprint];
-}
-
-function invariant(message: string, cause?: unknown): never {
-  throw new ApiKeyStoreInvariantError(message, { cause });
-}
-
-function assertRecordEntry(
-  entry: Deno.KvEntry<unknown> | Deno.KvEntryMaybe<unknown>,
-  expectedId?: string,
-): PersistedApiKey {
-  let persisted: PersistedApiKey;
-  try {
-    persisted = assertPersistedApiKey(entry.value);
-  } catch (error) {
-    invariant("invalid persisted record", error);
-  }
-
-  const keyId = entry.key[API_KEY_PREFIX.length];
-  if (
-    entry.key.length !== API_KEY_PREFIX.length + 1 ||
-    typeof keyId !== "string" || keyId.length === 0
-  ) {
-    invariant("invalid record key tuple");
-  }
-  if (persisted.id !== keyId || (expectedId !== undefined && keyId !== expectedId)) {
-    invariant("record id does not match its key tuple");
-  }
-  return persisted;
-}
-
-function assertClaimFingerprint(entry: Deno.KvEntry<string>): string {
-  const fingerprint = entry.key[API_KEY_UNIQUE_PREFIX.length];
-  if (
-    entry.key.length !== API_KEY_UNIQUE_PREFIX.length + 1 ||
-    typeof fingerprint !== "string" ||
-    !isApiKeyFingerprint(fingerprint)
-  ) {
-    invariant("invalid unique-claim key tuple");
-  }
-  if (typeof entry.value !== "string" || entry.value.length === 0) {
-    invariant("invalid unique-claim owner id");
-  }
-  return fingerprint;
-}
-
-async function hydrateAndVerify(persisted: PersistedApiKey): Promise<ApiKey> {
-  const plaintext = await decryptApiKey(persisted.encryptedKey);
-  const actualFingerprint = await fingerprintApiKey(plaintext);
-  if (actualFingerprint !== persisted.fingerprint) {
-    invariant("record fingerprint does not match its ciphertext");
-  }
-  const { fingerprint: _fingerprint, ...apiKey } = persisted;
-  return { ...apiKey, key: plaintext };
-}
-
-function assertMetadata(metadata: ApiKeyMetadata): void {
-  if (
-    metadata.status !== "active" && metadata.status !== "inactive" &&
-    metadata.status !== "invalid"
-  ) {
-    invariant("metadata mutation produced an invalid status");
-  }
-  if (
-    typeof metadata.useCount !== "number" ||
-    !Number.isFinite(metadata.useCount) || metadata.useCount < 0
-  ) {
-    invariant("metadata mutation produced an invalid useCount");
-  }
-  if (
-    metadata.lastUsed !== undefined &&
-    (typeof metadata.lastUsed !== "number" ||
-      !Number.isFinite(metadata.lastUsed) || metadata.lastUsed < 0)
-  ) {
-    invariant("metadata mutation produced an invalid lastUsed");
-  }
-}
-
 let lastApiKeyCreatedAtMs = 0;
 function nextApiKeyCreatedAt(): number {
   const now = Date.now();
@@ -161,60 +71,24 @@ function nextApiKeyCreatedAt(): number {
   return createdAt;
 }
 
+function corruptResult(
+  error: unknown,
+): { ok: false; code: "store-corrupt" } | never {
+  if (error instanceof ApiKeyStoreInvariantError) {
+    return { ok: false, code: "store-corrupt" };
+  }
+  throw error;
+}
+
 class DenoKvApiKeyStore implements ApiKeyStore {
   constructor(private readonly kv: Deno.Kv) {}
 
-  async list(): Promise<ApiKey[]> {
-    const recordsByFingerprint = new Map<string, PersistedApiKey>();
-    const recordIter = this.kv.list<unknown>({ prefix: API_KEY_PREFIX });
-    for await (const entry of recordIter) {
-      const persisted = assertRecordEntry(entry);
-      if (recordsByFingerprint.has(persisted.fingerprint)) {
-        invariant("multiple records own the same fingerprint");
-      }
-      recordsByFingerprint.set(persisted.fingerprint, persisted);
-    }
-
-    const claimsByFingerprint = new Map<string, string>();
-    const claimIter = this.kv.list<string>({ prefix: API_KEY_UNIQUE_PREFIX });
-    for await (const entry of claimIter) {
-      const fingerprint = assertClaimFingerprint(entry);
-      claimsByFingerprint.set(fingerprint, entry.value);
-    }
-
-    if (recordsByFingerprint.size !== claimsByFingerprint.size) {
-      invariant("record and unique-claim counts differ");
-    }
-    for (const [fingerprint, persisted] of recordsByFingerprint) {
-      if (claimsByFingerprint.get(fingerprint) !== persisted.id) {
-        invariant("record is not owned by its unique claim");
-      }
-    }
-    for (const [fingerprint, id] of claimsByFingerprint) {
-      if (recordsByFingerprint.get(fingerprint)?.id !== id) {
-        invariant("unique claim is dangling or points at the wrong record");
-      }
-    }
-
-    const keys: ApiKey[] = [];
-    for (const persisted of recordsByFingerprint.values()) {
-      keys.push(await hydrateAndVerify(persisted));
-    }
-    return keys;
+  list(): Promise<ApiKey[]> {
+    return loadVerifiedApiKeys(this.kv);
   }
 
-  async get(id: string): Promise<ApiKey | null> {
-    const recordEntry = await this.kv.get<unknown>(apiKeyRecordKey(id));
-    if (recordEntry.value === null) return null;
-
-    const persisted = assertRecordEntry(recordEntry, id);
-    const claimEntry = await this.kv.get<string>(
-      apiKeyUniqueClaimKey(persisted.fingerprint),
-    );
-    if (claimEntry.value !== id) {
-      invariant("record is not owned by its unique claim");
-    }
-    return hydrateAndVerify(persisted);
+  get(id: string): Promise<ApiKey | null> {
+    return loadVerifiedApiKey(this.kv, id);
   }
 
   async create(plaintext: string): Promise<ApiKeyStoreCreateResult> {
@@ -249,13 +123,12 @@ class DenoKvApiKeyStore implements ApiKeyStore {
         status: "active",
         createdAt,
       };
-      const persisted = createPersistedApiKey(key, fingerprint);
       const revision = getNextRevisionValue(revisionEntry);
       const result = await this.kv.atomic()
         .check(recordEntry)
         .check(claimEntry)
         .check(revisionEntry)
-        .set(recordKey, persisted)
+        .set(recordKey, createPersistedApiKey(key, fingerprint))
         .set(claimKey, id)
         .set(API_KEY_CACHE_REVISION_KEY, revision)
         .commit();
@@ -273,12 +146,9 @@ class DenoKvApiKeyStore implements ApiKeyStore {
 
       let persisted: PersistedApiKey;
       try {
-        persisted = assertRecordEntry(recordEntry, id);
+        persisted = assertApiKeyRecordEntry(recordEntry, id);
       } catch (error) {
-        if (error instanceof ApiKeyStoreInvariantError) {
-          return { ok: false, code: "store-corrupt" };
-        }
-        throw error;
+        return corruptResult(error);
       }
       const claimKey = apiKeyUniqueClaimKey(persisted.fingerprint);
       const [claimEntry, revisionEntry] = await Promise.all([
@@ -316,31 +186,25 @@ class DenoKvApiKeyStore implements ApiKeyStore {
       let persisted: PersistedApiKey;
       let current: ApiKey;
       try {
-        persisted = assertRecordEntry(recordEntry, id);
-        current = await hydrateAndVerify(persisted);
+        persisted = assertApiKeyRecordEntry(recordEntry, id);
+        current = await hydrateApiKeyRecord(persisted);
       } catch (error) {
-        if (error instanceof ApiKeyStoreInvariantError || error instanceof DOMException) {
-          return { ok: false, code: "store-corrupt" };
-        }
-        throw error;
+        return corruptResult(error);
       }
 
-      const claimEntry = await this.kv.get<string>(
-        apiKeyUniqueClaimKey(persisted.fingerprint),
-      );
+      const [claimEntry, revisionEntry] = await Promise.all([
+        this.kv.get<string>(apiKeyUniqueClaimKey(persisted.fingerprint)),
+        this.kv.get<number>(API_KEY_CACHE_REVISION_KEY),
+      ]);
       if (claimEntry.value !== id) {
         return { ok: false, code: "store-corrupt" };
       }
-      const revisionEntry = await this.kv.get<number>(API_KEY_CACHE_REVISION_KEY);
+
       const metadata = mutate(current);
-      assertMetadata(metadata);
+      assertApiKeyMetadata(metadata);
       const updatedPersisted: PersistedApiKey = {
         ...persisted,
-        status: metadata.status,
-        useCount: metadata.useCount,
-        ...(metadata.lastUsed === undefined
-          ? { lastUsed: undefined }
-          : { lastUsed: metadata.lastUsed }),
+        ...metadata,
       };
       const revision = getNextRevisionValue(revisionEntry);
       const result = await this.kv.atomic()
@@ -371,15 +235,22 @@ class DenoKvApiKeyStore implements ApiKeyStore {
     const entry = await this.kv.get<unknown>(recordKey);
     if (entry.value === null) return "missing";
 
-    const persisted = assertRecordEntry(entry, id);
-    const mergedLastUsed = Math.max(persisted.lastUsed ?? 0, lastUsed ?? 0) ||
-      undefined;
+    const persisted = assertApiKeyRecordEntry(entry, id);
+    const claimEntry = await this.kv.get<string>(
+      apiKeyUniqueClaimKey(persisted.fingerprint),
+    );
+    if (claimEntry.value !== id) {
+      throw new ApiKeyStoreInvariantError(
+        "record is not owned by its unique claim",
+      );
+    }
     const result = await this.kv.atomic()
       .check(entry)
+      .check(claimEntry)
       .set(recordKey, {
         ...persisted,
         useCount: Math.max(persisted.useCount, useCount),
-        lastUsed: mergedLastUsed,
+        lastUsed: Math.max(persisted.lastUsed ?? 0, lastUsed ?? 0) || undefined,
       })
       .commit();
     return result.ok ? "updated" : "conflict";

@@ -48,6 +48,7 @@ export type ProxyResult =
   };
 
 type ProxyLogContext = Record<string, string | undefined>;
+type SelectedApiKey = NonNullable<ReturnType<typeof getNextApiKeyFast>>;
 
 function applyStandardHeaders(headers: Headers): void {
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
@@ -143,47 +144,56 @@ function recordCircuitOutcome(status: number): void {
   }
 }
 
+async function selectApiKey(
+  context: ProxyLogContext,
+): Promise<SelectedApiKey | null> {
+  await refreshApiKeyCacheIfChanged();
+  const cached = getNextApiKeyFast(Date.now());
+  if (cached) return cached;
+
+  try {
+    await kvMergeAllApiKeysIntoCache();
+  } catch (error) {
+    // The strict store still rejects malformed record/claim state. The proxy
+    // path contains that failure and continues from the last verified cache.
+    logger.warn(
+      "api_key_cache_refresh_failed",
+      { ...context, phase: "empty_pool_merge" },
+      error,
+    );
+  }
+  return getNextApiKeyFast(Date.now());
+}
+
+function buildNoApiKeyResult(): ProxyResult {
+  const now = Date.now();
+  const cooldowns = state.cachedActiveKeyIds
+    .map((id) => state.keyCooldownUntil.get(id) ?? 0)
+    .filter((ms) => ms > now);
+  const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
+  const retryAfterSec = minCooldownUntil > now
+    ? Math.ceil((minCooldownUntil - now) / 1000)
+    : 0;
+
+  const status = state.cachedActiveKeyIds.length > 0 ? 429 : 500;
+  metrics.inc(
+    "proxy_requests_total",
+    status === 429 ? "no_key_cooldown" : "no_key",
+  );
+  return {
+    kind: "error",
+    message: "没有可用的 API 密钥",
+    status,
+    retryAfterSec: retryAfterSec > 0 ? retryAfterSec : undefined,
+  };
+}
+
 export async function forwardChatCompletion(
   requestBody: Record<string, unknown>,
   context: ProxyLogContext = {},
 ): Promise<ProxyResult> {
-  await refreshApiKeyCacheIfChanged();
-  let apiKeyData = getNextApiKeyFast(Date.now());
-  if (!apiKeyData) {
-    try {
-      await kvMergeAllApiKeysIntoCache();
-    } catch (error) {
-      // A forced refresh must preserve the last verified cache just like the
-      // revision-driven refresh path. Persistent invariant failures are logged
-      // but must not escape through the proxy request path.
-      logger.warn(
-        "api_key_cache_refresh_failed",
-        { ...context, phase: "empty_pool_merge" },
-        error,
-      );
-    }
-    apiKeyData = getNextApiKeyFast(Date.now());
-  }
-  if (!apiKeyData) {
-    const now = Date.now();
-    const cooldowns = state.cachedActiveKeyIds
-      .map((id) => state.keyCooldownUntil.get(id) ?? 0)
-      .filter((ms) => ms > now);
-    const minCooldownUntil = cooldowns.length > 0 ? Math.min(...cooldowns) : 0;
-    const retryAfterSec = minCooldownUntil > now
-      ? Math.ceil((minCooldownUntil - now) / 1000)
-      : 0;
-
-    const status = state.cachedActiveKeyIds.length > 0 ? 429 : 500;
-    const outcome = status === 429 ? "no_key_cooldown" : "no_key";
-    metrics.inc("proxy_requests_total", outcome);
-    return {
-      kind: "error",
-      message: "没有可用的 API 密钥",
-      status,
-      retryAfterSec: retryAfterSec > 0 ? retryAfterSec : undefined,
-    };
-  }
+  const apiKeyData = await selectApiKey(context);
+  if (!apiKeyData) return buildNoApiKeyResult();
 
   let sawModelNotFound = false;
 

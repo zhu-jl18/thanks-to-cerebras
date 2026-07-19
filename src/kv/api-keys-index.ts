@@ -66,10 +66,14 @@ async function findApiKeyValueIndexReplacement(
       // A malformed unrelated record must not prevent an admin from deleting
       // a valid key. It cannot safely become the replacement owner, so skip it
       // and preserve the same diagnostic shape used by cache hydration.
-      logger.warn("api_key_value_index_replacement_scan_skipped", {
-        keyId: candidateId,
-        kvKey: String(entry.key),
-      }, error);
+      logger.warn(
+        "api_key_value_index_replacement_scan_skipped",
+        {
+          keyId: candidateId,
+          kvKey: String(entry.key),
+        },
+        error,
+      );
     }
   }
   return null;

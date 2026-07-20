@@ -13,7 +13,7 @@
     /* ========== 亮色主题（默认） ========== */
     body, body.light {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-      background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%);
+      background: #f8fafc;
       min-height: 100vh;
       padding: 40px 20px;
       color: #1e293b;
@@ -21,19 +21,18 @@
     }
     body .container, body.light .container { max-width: 600px; margin: 0 auto; }
     body .header, body.light .header { text-align: center; margin-bottom: 24px; position: relative; }
-    body .logo, body.light .logo { width: 48px; height: 48px; margin: 0 auto 12px; filter: drop-shadow(0 0 16px rgba(6, 182, 212, 0.5)); }
+    body .logo, body.light .logo { width: 48px; height: 48px; margin: 0 auto 12px; }
     body h1, body.light h1 { font-size: 22px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
-    body h1 span, body.light h1 span { background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body h1 span, body.light h1 span { color: #0891b2; }
     body .subtitle, body.light .subtitle { font-size: 13px; color: #64748b; }
     body .card, body.light .card {
-      background: rgba(255, 255, 255, 0.9);
-      backdrop-filter: blur(12px);
-      border: 1px solid rgba(6, 182, 212, 0.15);
-      border-radius: 12px;
-      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+      background: #fff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
       overflow: hidden;
     }
-    body .tabs, body.light .tabs { display: flex; border-bottom: 1px solid rgba(6, 182, 212, 0.15); background: rgba(248, 250, 252, 0.8); }
+    body .tabs, body.light .tabs { display: flex; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
     body .tab, body.light .tab {
       flex: 1; padding: 12px 16px; text-align: center; font-size: 13px; font-weight: 500;
       color: #64748b; cursor: pointer; border: none; background: transparent;
@@ -44,27 +43,27 @@
     body .tab-content, body.light .tab-content {
       display: none;
       padding: 20px;
-      background: rgba(255, 255, 255, 0.28);
+      background: #fff;
       min-height: 320px;
     }
     body .tab-content.active, body.light .tab-content.active { display: block; }
-    body .stats-row, body.light .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid rgba(6, 182, 212, 0.1); }
-    body .stat-item, body.light .stat-item { text-align: center; padding: 10px; background: rgba(6, 182, 212, 0.06); border-radius: 8px; border: 1px solid rgba(6, 182, 212, 0.12); }
-    body .stat-value, body.light .stat-value { font-size: 22px; font-weight: 600; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    body .stats-row, body.light .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #e2e8f0; }
+    body .stat-item, body.light .stat-item { text-align: center; padding: 10px; background: #f8fafc; border-radius: 4px; border: 1px solid #e2e8f0; }
+    body .stat-value, body.light .stat-value { font-size: 22px; font-weight: 600; color: #1e293b; }
     body .stat-label, body.light .stat-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
     body .form-group, body.light .form-group { margin-bottom: 14px; }
     body .form-group label, body.light .form-group label { display: block; margin-bottom: 4px; color: #475569; font-size: 12px; font-weight: 500; }
     body .form-control, body.light .form-control {
-      width: 100%; padding: 10px 12px; background: rgba(248, 250, 252, 0.9); border: 1px solid rgba(6, 182, 212, 0.2);
-      border-radius: 8px; font-size: 13px; color: #1e293b; font-family: 'Inter', sans-serif; transition: all 0.2s;
+      width: 100%; padding: 10px 12px; background: #f8fafc; border: 1px solid #cbd5e1;
+      border-radius: 4px; font-size: 13px; color: #1e293b; font-family: 'Inter', sans-serif; transition: all 0.2s;
     }
     body .form-control::placeholder, body.light .form-control::placeholder { color: #94a3b8; }
     body .form-control:focus, body.light .form-control:focus { outline: none; border-color: #06b6d4; box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.15); }
     textarea.form-control { resize: vertical; min-height: 70px; }
     .btn {
-      background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%); color: #fff; border: none;
-      padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500;
-      transition: all 0.2s; font-family: 'Inter', sans-serif; box-shadow: 0 2px 8px rgba(6, 182, 212, 0.3);
+      background: #0891b2; color: #fff; border: none;
+      padding: 8px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;
+      transition: filter 0.2s; font-family: 'Inter', sans-serif;
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -74,19 +73,19 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(6, 182, 212, 0.4); }
+    .btn:hover { filter: brightness(0.9); }
     body .btn-outline, body.light .btn-outline { background: transparent; color: #0891b2; border: 1px solid rgba(6, 182, 212, 0.4); box-shadow: none; }
     body .btn-outline:hover, body.light .btn-outline:hover { background: rgba(6, 182, 212, 0.08); transform: none; }
     body .btn-danger, body.light .btn-danger { background: transparent; color: #dc2626; border: 1px solid rgba(220, 38, 38, 0.4); box-shadow: none; }
     body .btn-danger:hover, body.light .btn-danger:hover { background: rgba(220, 38, 38, 0.08); transform: none; }
     body .btn-success, body.light .btn-success { background: transparent; color: #16a34a; border: 1px solid rgba(22, 163, 74, 0.4); box-shadow: none; }
     body .btn-success:hover, body.light .btn-success:hover { background: rgba(22, 163, 74, 0.08); transform: none; }
-    body .divider, body.light .divider { height: 1px; background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.15), transparent); margin: 16px 0; }
+    body .divider, body.light .divider { height: 1px; background: #e2e8f0; margin: 16px 0; }
     body .list-item, body.light .list-item {
-      background: rgba(248, 250, 252, 0.8); border: 1px solid rgba(6, 182, 212, 0.1); border-radius: 8px;
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px;
       padding: 10px 12px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; transition: all 0.2s;
     }
-    body .list-item:hover, body.light .list-item:hover { border-color: rgba(6, 182, 212, 0.2); background: rgba(255, 255, 255, 0.9); }
+    body .list-item:hover, body.light .list-item:hover { border-color: #cbd5e1; background: #fff; }
     .item-info { flex: 1; min-width: 0; }
     body .item-primary, body.light .item-primary { display: flex; align-items: center; gap: 6px; color: #334155; font-size: 11px; margin-bottom: 2px; flex-wrap: wrap; }
     .key-text { font-family: 'JetBrains Mono', monospace; word-break: break-all; }
@@ -119,33 +118,36 @@
     body .footer span, body.light .footer span { color: #06b6d4; }
     body #authOverlay, body.light #authOverlay {
       position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%);
+      background: #f8fafc;
       display: flex; align-items: center; justify-content: center; z-index: 9999;
     }
     body .auth-card, body.light .auth-card {
-      background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px); border: 1px solid rgba(6, 182, 212, 0.15);
-      border-radius: 12px; padding: 32px; max-width: 340px; width: 90%; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+      background: #fff; border: 1px solid #cbd5e1;
+      border-radius: 8px; padding: 32px; max-width: 340px; width: 90%; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
     }
     body .auth-card h2, body.light .auth-card h2 { color: #1e293b; }
+    body .auth-card h2 span, body.light .auth-card h2 span { color: #0891b2; }
 
     /* ========== 暗色主题 ========== */
     body.dark {
-      background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+      background: #0f172a;
       color: #e2e8f0;
     }
     body.dark h1 { color: #f1f5f9; }
+    body.dark h1 span { color: #06b6d4; }
     body.dark .card {
-      background: rgba(30, 41, 59, 0.8);
-      border: 1px solid rgba(6, 182, 212, 0.2);
-      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+      background: #1e293b;
+      border: 1px solid #334155;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.24);
     }
-    body.dark .tabs { background: rgba(15, 23, 42, 0.5); }
-    body.dark .tab-content { background: rgba(15, 23, 42, 0.35); }
+    body.dark .tabs { background: #0f172a; }
+    body.dark .tab-content { background: #1e293b; }
     body.dark .tab:hover { color: #94a3b8; }
-    body.dark .stat-item { background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.15); }
+    body.dark .stat-item { background: #0f172a; border: 1px solid #334155; }
+    body.dark .stat-value { color: #f1f5f9; }
     body.dark .form-group label { color: #94a3b8; }
     body.dark .form-control {
-      background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(6, 182, 212, 0.25);
+      background: #0f172a; border: 1px solid #475569;
       color: #e2e8f0;
     }
     body.dark .form-control::placeholder { color: #475569; }
@@ -156,11 +158,11 @@
     body.dark .btn-danger:hover { background: rgba(248, 113, 113, 0.1); }
     body.dark .btn-success { color: #4ade80; border-color: rgba(74, 222, 128, 0.4); }
     body.dark .btn-success:hover { background: rgba(74, 222, 128, 0.1); }
-    body.dark .divider { background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.2), transparent); }
+    body.dark .divider { background: #334155; }
     body.dark .list-item {
-      background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(6, 182, 212, 0.1);
+      background: #0f172a; border: 1px solid #334155;
     }
-    body.dark .list-item:hover { border-color: rgba(6, 182, 212, 0.25); background: rgba(15, 23, 42, 0.8); }
+    body.dark .list-item:hover { border-color: #475569; background: #0f172a; }
     body.dark .item-primary { color: #cbd5e1; }
     body.dark .status-active { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
     body.dark .status-inactive { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
@@ -178,13 +180,14 @@
     body.dark .auth-unknown { background: rgba(148, 163, 184, 0.12); color: #94a3b8; }
     body.dark .footer { color: #475569; }
     body.dark #authOverlay {
-      background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+      background: #0f172a;
     }
     body.dark .auth-card {
-      background: rgba(30, 41, 59, 0.9); border: 1px solid rgba(6, 182, 212, 0.25);
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      background: #1e293b; border: 1px solid #334155;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.24);
     }
     body.dark .auth-card h2 { color: #f1f5f9; }
+    body.dark .auth-card h2 span { color: #06b6d4; }
 
     /* ========== 主题切换按钮 ========== */
     .theme-toggle {
@@ -327,10 +330,10 @@
   <div id="authOverlay">
     <div class="auth-card">
       <div style="text-align: center; margin-bottom: 20px;">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" style="width: 40px; height: 40px; margin-bottom: 8px; filter: drop-shadow(0 0 12px rgba(6, 182, 212, 0.5));">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" style="width: 40px; height: 40px; margin-bottom: 8px;">
           <path fill="#06b6d4" d="M22 4h-9.77L11 .34a.5.5 0 0 0-.5-.34H2a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h9.65L13 23.68a.5.5 0 0 0 .47.32H22a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2ZM7.5 15a4.5 4.5 0 1 1 2.92-7.92.5.5 0 1 1-.65.76A3.5 3.5 0 1 0 11 11H7.5a.5.5 0 0 1 0-1h4a.5.5 0 0 1 .5.5A4.5 4.5 0 0 1 7.5 15Zm11.9-4a11.26 11.26 0 0 1-1.86 3.29 6.67 6.67 0 0 1-1.07-1.48.5.5 0 0 0-.93.38 8 8 0 0 0 1.34 1.87 8.9 8.9 0 0 1-.65.62L14.62 11ZM23 22a1 1 0 0 1-1 1h-7.4l2.77-3.17a.49.49 0 0 0 .09-.48l-.91-2.66a9.36 9.36 0 0 0 1-.89c1 1 1.93 1.91 2.12 2.08a.5.5 0 0 0 .68-.74 43.48 43.48 0 0 1-2.13-2.1 11.49 11.49 0 0 0 2.22-4h1.06a.5.5 0 0 0 0-1H18V9.5a.5.5 0 0 0-1 0v.5h-2.5a.49.49 0 0 0-.21 0l-1.72-5H22a1 1 0 0 1 1 1Z"/>
         </svg>
-        <h2 style="color: #f1f5f9; font-size: 18px;"><span style="background: linear-gradient(135deg, #06b6d4, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Cerebras</span> Translator</h2>
+        <h2 style="font-size: 18px;"><span>Cerebras</span> Translator</h2>
       </div>
       <p id="authTitle" style="color: #94a3b8; font-size: 12px; text-align: center; margin-bottom: 20px;">加载中...</p>
       <div id="resetSetupTokenGroup" class="form-group" style="display: none;">
